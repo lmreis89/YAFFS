@@ -1,0 +1,15 @@
+--- rpc/rpc.cc	2012-10-31 13:11:59.636819845 +0000
++++ rpc/rpc.cc	2012-10-31 16:00:09.746854159 +0000
+@@ -99,10 +99,11 @@
+ 
+ rpcc::rpcc(sockaddr_in d, bool retrans) : 
+ 	dst_(d), srv_nonce_(0), bind_done_(false), xid_(1), lossytest_(0), 
+-	retrans_(retrans), chan_(NULL)
++	retrans_(retrans), reachable_(true), chan_(NULL), destroy_wait_ (false)
+ {
+ 	assert(pthread_mutex_init(&m_, 0) == 0);
+ 	assert(pthread_mutex_init(&chan_m_, 0) == 0);
++	assert(pthread_cond_init(&destroy_wait_c_, 0) == 0);
+ 
+ 	if (retrans) {
+ 		set_rand_seed();

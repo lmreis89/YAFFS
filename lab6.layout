@@ -1,0 +1,67 @@
+<?xml version="1.0" encoding="UTF-8" standalone="yes" ?>
+<CodeBlocks_layout_file>
+	<ActiveTarget name="Release" />
+	<File name="config.cc" open="1" top="0" tabpos="5">
+		<Cursor position="4573" topLine="130" />
+	</File>
+	<File name="config.h" open="1" top="0" tabpos="10">
+		<Cursor position="0" topLine="0" />
+	</File>
+	<File name="extent_smain.cc" open="1" top="0" tabpos="14">
+		<Cursor position="99" topLine="0" />
+	</File>
+	<File name="lock_client.cc" open="1" top="0" tabpos="3">
+		<Cursor position="1472" topLine="57" />
+	</File>
+	<File name="lock_client.h" open="1" top="0" tabpos="16">
+		<Cursor position="392" topLine="3" />
+	</File>
+	<File name="lock_demo.cc" open="0" top="0" tabpos="0">
+		<Cursor position="0" topLine="8" />
+	</File>
+	<File name="lock_protocol.h" open="0" top="0" tabpos="12">
+		<Cursor position="229" topLine="0" />
+	</File>
+	<File name="lock_server.cc" open="1" top="0" tabpos="4">
+		<Cursor position="1194" topLine="85" />
+	</File>
+	<File name="lock_server.h" open="0" top="0" tabpos="1">
+		<Cursor position="349" topLine="16" />
+	</File>
+	<File name="lock_smain.cc" open="1" top="0" tabpos="13">
+		<Cursor position="98" topLine="0" />
+	</File>
+	<File name="lock_tester.cc" open="0" top="0" tabpos="12">
+		<Cursor position="179" topLine="145" />
+	</File>
+	<File name="log.cc" open="1" top="0" tabpos="9">
+		<Cursor position="0" topLine="27" />
+	</File>
+	<File name="paxos.cc" open="1" top="0" tabpos="6">
+		<Cursor position="8864" topLine="294" />
+	</File>
+	<File name="paxos.h" open="1" top="0" tabpos="11">
+		<Cursor position="0" topLine="45" />
+	</File>
+	<File name="rpc/rpc.cc" open="1" top="0" tabpos="12">
+		<Cursor position="3835" topLine="68" />
+	</File>
+	<File name="rsm.cc" open="1" top="1" tabpos="1">
+		<Cursor position="10387" topLine="472" />
+	</File>
+	<File name="rsm.h" open="1" top="0" tabpos="2">
+		<Cursor position="540" topLine="6" />
+	</File>
+	<File name="rsm_client.cc" open="1" top="0" tabpos="7">
+		<Cursor position="1347" topLine="31" />
+	</File>
+	<File name="rsm_client.h" open="1" top="0" tabpos="8">
+		<Cursor position="519" topLine="24" />
+	</File>
+	<File name="rsm_protocol.h" open="0" top="0" tabpos="7">
+		<Cursor position="0" topLine="57" />
+	</File>
+	<File name="yfs_client.cc" open="1" top="0" tabpos="15">
+		<Cursor position="596" topLine="9" />
+	</File>
+</CodeBlocks_layout_file>

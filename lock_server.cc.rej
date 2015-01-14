@@ -1,0 +1,13 @@
+--- lock_server.cc	2012-11-26 11:53:44.473426603 +0000
++++ lock_server.cc	2012-11-26 11:53:55.753482525 +0000
+@@ -6,8 +6,8 @@
+ #include <unistd.h>
+ #include <arpa/inet.h>
+ 
+-lock_server::lock_server():
+-  nacquire (0)
++lock_server::lock_server(class rsm *_rsm):
++ rsm(_rsm), nacquire (0)
+ {
+ }
+ 

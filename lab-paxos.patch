@@ -1,0 +1,3540 @@
+diff -rupN original/config.cc new/config.cc
+--- original/config.cc	1970-01-01 01:00:00.000000000 +0100
++++ new/config.cc	2012-10-31 13:23:46.808326680 +0000
+@@ -0,0 +1,347 @@
++#include <sstream>
++#include <iostream>
++#include <stdio.h>
++#include "config.h"
++#include "paxos.h"
++#include "handle.h"
++
++// The config module maintains views. As a node joins or leaves a
++// view, the next view will be the same as previous view, except with
++// the new node added or removed. The first view contains only node
++// 1. If node 2 joins after the first node (it will download the views
++// from node 1), it will learn about view 1 with the first node as the
++// only member.  It will then invoke Paxos to create the next view.
++// It will tell Paxos to ask the nodes in view 1 to agree on the value
++// {1, 2}.  If Paxos returns success, then it moves to view 2 with
++// {1,2} as the members. When node 3 joins, the config module runs
++// Paxos with the nodes in view 2 and the proposed value to be
++// {1,2,3}. And so on.  When a node discovers that some node of the
++// current view is not responding, it kicks off Paxos to propose a new
++// value (the current view minus the node that isn't responding). The
++// config module uses Paxos to create a total order of views, and it
++// is ensured that the majority of the previous view agrees to the
++// next view.  The Paxos log contains all the values (i.e., views)
++// agreed on.
++//
++// The RSM module informs config to add nodes. The config module
++// runs a heartbeater thread that checks in with nodes.  If a node
++// doesn't respond, the config module will invoke Paxos's proposer to
++// remove the node.  Higher layers will learn about this change when a
++// Paxos acceptor accepts the new proposed value through
++// paxos_commit().
++//
++// To be able to bring other nodes up to date to the latest formed
++// view, each node will have a complete history of all view numbers
++// and their values that it knows about. At any time a node can reboot
++// and when it re-joins, it may be many views behind; by remembering
++// all views, the other nodes can bring this re-joined node up to
++// date.
++
++static void *
++heartbeatthread(void *x)
++{
++  config *r = (config *) x;
++  r->heartbeater();
++  return 0;
++}
++
++config::config(std::string _first, std::string _me, config_view_change *_vc) 
++  : myvid (0), first (_first), me (_me), vc (_vc)
++{
++  assert (pthread_mutex_init(&cfg_mutex, NULL) == 0);
++  assert(pthread_cond_init(&config_cond, NULL) == 0);  
++
++  std::ostringstream ost;
++  ost << me;
++
++  acc = new acceptor(this, me == _first, me, ost.str());
++  pro = new proposer(this, acc, me);
++
++  // XXX hack; maybe should have its own port number
++  pxsrpc = acc->get_rpcs();
++  pxsrpc->reg(paxos_protocol::heartbeat, this, &config::heartbeat);
++
++  assert(pthread_mutex_lock(&cfg_mutex)==0);
++
++  reconstruct();
++
++  pthread_t th;
++  assert (pthread_create(&th, NULL, &heartbeatthread, (void *) this) == 0);
++  assert(pthread_mutex_unlock(&cfg_mutex)==0);
++}
++
++void
++config::restore(std::string s)
++{
++  assert(pthread_mutex_lock(&cfg_mutex)==0);
++  acc->restore(s);
++  reconstruct();
++  assert(pthread_mutex_unlock(&cfg_mutex)==0);
++}
++
++// caller should hold cfg_mutex
++std::vector<std::string>
++config::get_view(unsigned instance)
++{
++  std::string value = acc->value(instance);
++  printf("get_view(%d): returns %s\n", instance, value.c_str());
++  return members(value);
++}
++
++std::vector<std::string>
++config::members(std::string value)
++{
++  std::istringstream ist(value);
++  std::string m;
++  std::vector<std::string> view;
++  while (ist >> m) {
++    view.push_back(m);
++  }
++  return view;
++}
++
++std::string
++config::value(std::vector<std::string> m)
++{
++  std::ostringstream ost;
++  for (unsigned i = 0; i < m.size(); i++)  {
++    ost << m[i];
++    ost << " ";
++  }
++  return ost.str();
++}
++
++// caller should hold cfg_mutex
++void
++config::reconstruct()
++{
++  if (acc->instance() > 0) {
++    std::string m;
++    myvid = acc->instance();
++    mems = get_view(myvid);
++    printf("config::reconstruct: %d %s\n", myvid, print_members(mems).c_str());
++  }
++}
++
++// Called by Paxos's acceptor.
++void
++config::paxos_commit(unsigned instance, std::string value)
++{
++  std::string m;
++  std::vector<std::string> newmem;
++  assert(pthread_mutex_lock(&cfg_mutex)==0);
++
++  newmem = members(value);
++  printf("config::paxos_commit: %d: %s\n", instance, 
++	 print_members(newmem).c_str());
++
++  for (unsigned i = 0; i < mems.size(); i++) {
++    printf("config::paxos_commit: is %s still a member?\n", mems[i].c_str());
++    if (!isamember(mems[i], newmem) && me != mems[i]) {
++      printf("config::paxos_commit: delete %s\n", mems[i].c_str());
++      mgr.delete_handle(mems[i]);
++    }
++  }
++
++  mems = newmem;
++  myvid = instance;
++  if (vc) {
++    assert(pthread_mutex_unlock(&cfg_mutex)==0);
++    vc->commit_change();
++    assert(pthread_mutex_lock(&cfg_mutex)==0);
++  }
++  assert(pthread_mutex_unlock(&cfg_mutex)==0);
++}
++
++bool
++config::ismember(std::string m)
++{
++  bool r;
++  assert(pthread_mutex_lock(&cfg_mutex)==0);
++  r = isamember(m, mems);
++  assert(pthread_mutex_unlock(&cfg_mutex)==0);
++  return r;
++}
++
++std::vector<std::string> 
++config::get_curview()
++{ 
++  std::vector<std::string> v;
++  assert(pthread_mutex_lock(&cfg_mutex)==0);
++  v = get_view(myvid);
++  assert(pthread_mutex_unlock(&cfg_mutex)==0);
++  return v;
++}
++
++std::vector<std::string> 
++config::get_prevview()
++{ 
++  std::vector<std::string> v;
++  assert(pthread_mutex_lock(&cfg_mutex)==0);
++  v = get_view(myvid - 1);
++  assert(pthread_mutex_unlock(&cfg_mutex)==0);
++  return v;
++}
++
++std::string 
++config::print_curview() 
++{ 
++  std::string s;
++  assert(pthread_mutex_lock(&cfg_mutex)==0);
++  s = print_members(mems); 
++  assert(pthread_mutex_unlock(&cfg_mutex)==0);
++  return s;
++};
++
++bool
++config::add(std::string new_m)
++{
++  std::vector<std::string> m;
++  assert(pthread_mutex_lock(&cfg_mutex)==0);
++  printf("config::add %s\n", new_m.c_str());
++  m = mems;
++  m.push_back(new_m);
++  std::string v = value(m);
++  assert(pthread_mutex_unlock(&cfg_mutex)==0);
++  bool r = pro->run(myvid+1, mems, v);
++  assert(pthread_mutex_lock(&cfg_mutex)==0);
++  if (r) {
++    printf("config::add: proposer returned success\n");
++  } else {
++    printf("config::add: proposer returned failure\n");
++  }
++  assert(pthread_mutex_unlock(&cfg_mutex)==0);
++  return r;
++}
++
++// caller should hold cfg_mutex
++bool
++config::remove_wo(std::string m)
++{
++  printf("config::remove: myvid %d remove? %s\n", myvid, m.c_str());
++  std::vector<std::string> n;
++  for (unsigned i = 0; i < mems.size(); i++) {
++    if (mems[i] != m) n.push_back(mems[i]);
++  }
++  std::string v = value(n);
++  assert(pthread_mutex_unlock(&cfg_mutex)==0);
++  bool r = pro->run(myvid+1, mems, v);
++  assert(pthread_mutex_lock(&cfg_mutex)==0);
++  if (r) {
++    printf("config::remove: proposer returned success\n");
++  } else {
++    printf("config::remove: proposer returned failure\n");
++  }
++  return r;
++}
++
++void
++config::heartbeater()
++{
++  struct timeval now;
++  struct timespec next_timeout;
++  std::string m;
++  heartbeat_t h;
++  bool stable;
++
++  assert(pthread_mutex_lock(&cfg_mutex)==0);
++  
++  while (1) {
++
++    gettimeofday(&now, NULL);
++    next_timeout.tv_sec = now.tv_sec + 3;
++    next_timeout.tv_nsec = 0;
++    printf("heartbeater: go to sleep\n");
++    pthread_cond_timedwait(&config_cond, &cfg_mutex, &next_timeout);
++
++    stable = true;
++
++    printf("heartbeater: current membership %s\n", print_members(mems).c_str());
++
++    if (!isamember(me, mems)) {
++      printf("heartbeater: not member yet; skip hearbeat\n");
++      continue;
++    }
++
++    //find the node with the smallest id
++    m = me;
++    for (unsigned i = 0; i < mems.size(); i++) {
++      if (m > mems[i])
++	m = mems[i];
++    }
++
++    if (m == me) {
++      //if i am the one with smallest id, ping the rest of the nodes
++      for (unsigned i = 0; i < mems.size(); i++) {
++	if (mems[i] != me) {
++	  if ((h = doheartbeat(mems[i])) != OK) {
++	    stable = false;
++	    m = mems[i];
++	    break;
++	  }
++	}
++      }
++    } else {
++      //the rest of the nodes ping the one with smallest id
++	if ((h = doheartbeat(m)) != OK) 
++	    stable = false;
++    }
++
++    if (!stable) {
++      remove_wo(m);
++    }
++  }
++
++  assert(pthread_mutex_unlock(&cfg_mutex)==0);
++}
++
++paxos_protocol::status
++config::heartbeat(std::string m, unsigned vid, int &r)
++{
++  assert(pthread_mutex_lock(&cfg_mutex)==0);
++  int ret = paxos_protocol::ERR;
++  r = (int) myvid;
++  printf("heartbeat from %s(%d) myvid %d\n", m.c_str(), vid, myvid);
++  if (vid == myvid) {
++    ret = paxos_protocol::OK;
++  } else if (pro->isrunning()) {
++    assert (vid == myvid + 1 || vid + 1 == myvid);
++    ret = paxos_protocol::OK;
++  } else {
++    ret = paxos_protocol::ERR;
++  }
++  assert(pthread_mutex_unlock(&cfg_mutex)==0);
++  return ret;
++}
++
++config::heartbeat_t
++config::doheartbeat(std::string m)
++{
++  int ret = rpc_const::timeout_failure;
++  int r;
++  unsigned vid = myvid;
++  heartbeat_t res = OK;
++
++  printf("doheartbeater to %s (%d)\n", m.c_str(), vid);
++  handle h(m);
++  if (h.get_rpcc()) {
++    assert(pthread_mutex_unlock(&cfg_mutex)==0);
++    ret = h.get_rpcc()->call(paxos_protocol::heartbeat, me, vid, r, 
++			 rpcc::to(1000));
++    assert(pthread_mutex_lock(&cfg_mutex)==0);
++  } 
++  if (ret != paxos_protocol::OK) {
++    if (ret == rpc_const::atmostonce_failure || 
++	ret == rpc_const::oldsrv_failure) {
++      mgr.delete_handle(m);
++    } else {
++      printf("doheartbeat: problem with %s (%d) my vid %d his vid %d\n", 
++	     m.c_str(), ret, vid, r);
++      if (ret < 0) res = FAILURE;
++      else res = VIEWERR;
++    }
++  }
++  printf("doheartbeat done %d\n", res);
++  return res;
++}
++
+diff -rupN original/config.h new/config.h
+--- original/config.h	1970-01-01 01:00:00.000000000 +0100
++++ new/config.h	2012-10-31 13:23:46.808326680 +0000
+@@ -0,0 +1,56 @@
++#ifndef config_h
++#define config_h
++
++#include <string>
++#include <vector>
++#include "paxos.h"
++
++class config_view_change {
++ public:
++  virtual void commit_change() = 0;
++  virtual ~config_view_change() {};
++};
++
++class config : public paxos_change {
++ private:
++  acceptor *acc;
++  proposer *pro;
++  rpcs *pxsrpc;
++  unsigned myvid;
++  std::string first;
++  std::string me;
++  config_view_change *vc;
++  std::vector<std::string> mems;
++  pthread_mutex_t cfg_mutex;
++  pthread_cond_t heartbeat_cond;
++  pthread_cond_t config_cond;
++  paxos_protocol::status heartbeat(std::string m, unsigned instance, int &r);
++  std::string value(std::vector<std::string> mems);
++  std::vector<std::string> members(std::string v);
++  std::vector<std::string> get_view(unsigned instance);
++  bool remove_wo(std::string);
++  void reconstruct();
++  typedef enum {
++    OK,	// response and same view #
++    VIEWERR,	// response but different view #
++    FAILURE,	// no response
++  } heartbeat_t;
++  heartbeat_t doheartbeat(std::string m);
++ public:
++  config(std::string _first, std::string _me, config_view_change *_vc);
++  unsigned vid() { return myvid; }
++  std::string myaddr() { return me; };
++  std::string dump() { return acc->dump(); };
++  void restore(std::string s);
++  bool add(std::string);
++  bool ismember(std::string m);
++  std::vector<std::string> get_curview();
++  std::vector<std::string> get_prevview();
++  std::string print_curview();
++  void heartbeater(void);
++  void paxos_commit(unsigned instance, std::string v);
++  rpcs *get_rpcs() { return acc->get_rpcs(); }
++  void breakpoint(int b) { pro->breakpoint(b); }
++};
++
++#endif
+diff -rupN original/extent_smain.cc new/extent_smain.cc
+--- original/extent_smain.cc	2012-10-31 13:11:59.636819845 +0000
++++ new/extent_smain.cc	2012-10-31 13:10:14.360297992 +0000
+@@ -9,6 +9,8 @@
+ int
+ main(int argc, char *argv[])
+ {
++  int count = 0;
++
+   if(argc != 2){
+     fprintf(stderr, "Usage: %s port\n", argv[0]);
+     exit(1);
+@@ -16,7 +18,12 @@ main(int argc, char *argv[])
+ 
+   setvbuf(stdout, NULL, _IONBF, 0);
+ 
+-  rpcs server(atoi(argv[1]));
++  char *count_env = getenv("RPC_COUNT");
++  if(count_env != NULL){
++    count = atoi(count_env);
++  }
++
++  rpcs server(atoi(argv[1]), count);
+   extent_server ls;
+ 
+   server.reg(extent_protocol::get, &ls, &extent_server::get);
+diff -rupN original/fuse.cc new/fuse.cc
+--- original/fuse.cc	2012-10-31 13:11:59.636819845 +0000
++++ new/fuse.cc	2012-10-31 13:10:14.360297992 +0000
+@@ -83,7 +83,7 @@ fuseserver_setattr(fuse_req_t req, fuse_
+ {
+   printf("fuseserver_setattr 0x%x\n", to_set);
+   if (FUSE_SET_ATTR_SIZE & to_set) {
+-    printf("   fuseserver_setattr set size to %zu\n", attr->st_size);
++    printf("   fuseserver_setattr set size to %llu\n", attr->st_size);
+     struct stat st;
+     // You fill this in
+ #if 0
+diff -rupN original/handle.cc new/handle.cc
+--- original/handle.cc	1970-01-01 01:00:00.000000000 +0100
++++ new/handle.cc	2012-10-31 13:23:46.816326730 +0000
+@@ -0,0 +1,87 @@
++#include "handle.h"
++#include <stdio.h>
++
++handle_mgr mgr;
++
++handle::handle(std::string m) 
++{
++  h = mgr.get_handle(m);
++}
++
++handle::~handle() 
++{
++  if (h != 0) mgr.done_handle(h);
++}
++
++handle_mgr::handle_mgr()
++{
++  assert (pthread_mutex_init(&handle_mutex, NULL) == 0);
++}
++
++struct hinfo *
++handle_mgr::get_handle(std::string m)
++{
++  int ret;
++  assert(pthread_mutex_lock(&handle_mutex)==0);
++  rpcc *cl = 0;
++  struct hinfo *h = 0;
++  if (hmap.find(m) == hmap.end()) {
++    sockaddr_in dstsock;
++    make_sockaddr(m.c_str(), &dstsock);
++    cl = new rpcc(dstsock);
++    printf("paxos::get_handle trying to bind...%s\n", m.c_str());
++    ret = cl->bind(rpcc::to(1000));
++    if (ret < 0) {
++      printf("handle_mgr::get_handle bind failure! %s %d\n", m.c_str(), ret);
++    } else {
++      printf("handle_mgr::get_handle bind succeeded %s\n", m.c_str());
++      hmap[m].cl = cl;
++      hmap[m].refcnt = 1;
++      hmap[m].del = false;
++      hmap[m].m = m;
++      h = &hmap[m];
++    }
++  } else if (!hmap[m].del) {
++      hmap[m].refcnt++;
++      h = &hmap[m];
++  }
++  assert(pthread_mutex_unlock(&handle_mutex)==0);
++  return h;
++}
++
++void 
++handle_mgr::done_handle(struct hinfo *h)
++{
++  assert(pthread_mutex_lock(&handle_mutex)==0);
++  h->refcnt--;
++  if (h->refcnt <= 0 && h->del)
++    delete_handle_wo(h->m);
++  assert(pthread_mutex_unlock(&handle_mutex)==0);
++}
++
++void
++handle_mgr::delete_handle(std::string m)
++{
++  assert(pthread_mutex_lock(&handle_mutex)==0);
++  delete_handle_wo(m);
++  assert(pthread_mutex_unlock(&handle_mutex)==0);
++}
++
++// Must be called with handle_mutex locked.
++void
++handle_mgr::delete_handle_wo(std::string m)
++{
++  if (hmap.find(m) == hmap.end()) {
++    printf("handle_mgr::delete_handle_wo: cl %s isn't in cl list\n", m.c_str());
++  } else {
++    printf("handle_mgr::delete_handle_wo: cl %s refcnt %d\n", m.c_str(),
++	   hmap[m].refcnt);
++    if (hmap[m].refcnt == 0) {
++      hmap[m].cl->cancel();
++      delete hmap[m].cl;
++      hmap.erase(m);
++    } else {
++      hmap[m].del = true;
++    }
++  }
++}
+diff -rupN original/handle.h new/handle.h
+--- original/handle.h	1970-01-01 01:00:00.000000000 +0100
++++ new/handle.h	2012-10-31 13:23:46.816326730 +0000
+@@ -0,0 +1,38 @@
++#ifndef handle_h
++#define handle_h
++
++#include <string>
++#include <vector>
++#include "rpc.h"
++
++struct hinfo {
++  rpcc *cl;
++  int refcnt;
++  bool del;
++  std::string m;
++};
++
++class handle {
++ private:
++  struct hinfo *h;
++ public:
++  handle(std::string m);
++  ~handle();
++  rpcc *get_rpcc() { return (h == 0) ? 0 : h->cl; };
++};
++
++class handle_mgr {
++ private:
++  pthread_mutex_t handle_mutex;
++  std::map<std::string, struct hinfo> hmap;
++ public:
++  handle_mgr();
++  struct hinfo *get_handle(std::string m);
++  void done_handle(struct hinfo *h);
++  void delete_handle(std::string m);
++  void delete_handle_wo(std::string m);
++};
++
++extern class handle_mgr mgr;
++
++#endif
+diff -rupN original/lock_smain.cc new/lock_smain.cc
+--- original/lock_smain.cc	2012-10-31 13:11:59.636819845 +0000
++++ new/lock_smain.cc	2012-10-31 13:47:57.171518639 +0000
+@@ -3,6 +3,8 @@
+ #include <stdlib.h>
+ #include <stdio.h>
+ #include "lock_server.h"
++#include "paxos.h"
++#include "rsm.h"
+ 
+ #include "jsl_log.h"
+ 
+@@ -18,8 +20,8 @@ main(int argc, char *argv[])
+ 
+   srandom(getpid());
+ 
+-  if(argc != 2){
+-    fprintf(stderr, "Usage: %s port\n", argv[0]);
++  if(argc != 3){
++    fprintf(stderr, "Usage: %s [master:]port [me:]port\n", argv[0]);
+     exit(1);
+   }
+ 
+@@ -29,6 +31,14 @@ main(int argc, char *argv[])
+   }
+ 
+   //jsl_set_debug(2);
++  // Comment out the next line to switch between the ordinary lock
++  // server and the RSM.  In Lab 5, we disable the lock server and
++  // implement Paxos.  In Lab 6, we will make the lock server use your
++  // RSM layer.
++#define	RSM
++#ifdef RSM
++  rsm rsm(argv[1], argv[2]);
++#endif
+ 
+ #ifndef RSM
+   lock_server ls;
+@@ -36,6 +46,7 @@ main(int argc, char *argv[])
+   server.reg(lock_protocol::stat, &ls, &lock_server::stat);
+ #endif
+ 
++
+   while(1)
+     sleep(1000);
+ }
+diff -rupN original/log.cc new/log.cc
+--- original/log.cc	1970-01-01 01:00:00.000000000 +0100
++++ new/log.cc	2012-10-31 13:23:46.820326748 +0000
+@@ -0,0 +1,128 @@
++#include "paxos.h"
++#include <fstream>
++#include <iostream>
++
++// Paxos must maintain some durable state (i.e., that survives power
++// failures) to run Paxos correct.  This module implements a log with
++// all durable state to run Paxos.  Since the values chosen correspond
++// to views, the log contains all views since the beginning of time.
++
++log::log(acceptor *_acc, std::string _me)
++  : pxs (_acc)
++{
++  name = "paxos-" + _me + ".log";
++  logread();
++}
++
++void
++log::logread(void)
++{
++  std::ifstream from;
++  std::string type;
++  unsigned instance;
++
++  from.open(name.c_str());
++  printf ("logread\n");
++  while (from >> type) {
++    if (type == "done") {
++      std::string v;
++      from >> instance;
++      from.get();
++      getline(from, v);
++      pxs->values[instance] = v;
++      pxs->instance_h = instance;
++      printf ("logread: instance: %d w. v = %s\n", instance, 
++	      pxs->values[instance].c_str());
++      pxs->v_a.clear();
++      pxs->n_h.n = 0;
++      pxs->n_a.n = 0;
++    } else if (type == "high") {
++      from >> pxs->n_h.n;
++      from >> pxs->n_h.m;
++      printf("logread: high update: %d(%s)\n", pxs->n_h.n, pxs->n_h.m.c_str());
++    } else if (type == "prop") {
++      std::string v;
++      from >> pxs->n_a.n;
++      from >> pxs->n_a.m;
++      from.get();
++      getline(from, v);
++      pxs->v_a = v;
++      printf("logread: prop update %d(%s) with v = %s\n", pxs->n_a.n, 
++	     pxs->n_a.m.c_str(), pxs->v_a.c_str());
++    } else {
++      printf("logread: unknown log record\n");
++      assert(0);
++    }
++  } 
++  from.close();
++}
++
++std::string 
++log::dump()
++{
++  std::ifstream from;
++  std::string res;
++  std::string v;
++  from.open(name.c_str());
++  while (getline(from, v)) {
++    res = res + v + "\n";
++  }
++  from.close();
++  return res;
++}
++
++void
++log::restore(std::string s)
++{
++  std::ofstream f;
++  printf("restore: %s\n", s.c_str());
++  f.open(name.c_str(), std::ios::trunc);
++  f << s;
++  f.close();
++}
++
++// XXX should be an atomic operation
++void
++log::loginstance(unsigned instance, std::string v)
++{
++  std::ofstream f;
++  f.open(name.c_str(), std::ios::app);
++  f << "done";
++  f << " ";
++  f << instance;
++  f << " ";
++  f << v;
++  f << "\n";
++  f.close();
++}
++
++void
++log::loghigh(prop_t n_h)
++{
++  std::ofstream f;
++  f.open(name.c_str(), std::ios::app);
++  f << "high";
++  f << " ";
++  f << n_h.n;
++  f << " ";
++  f << n_h.m;
++  f << "\n";
++  f.close();
++}
++
++void
++log::logprop(prop_t n, std::string v)
++{
++  std::ofstream f;
++  f.open(name.c_str(), std::ios::app);
++  f << "prop";
++  f << " ";
++  f << n.n;
++  f << " ";
++  f << n.m;
++  f << " ";
++  f << v;
++  f << "\n";
++  f.close();
++}
++
+diff -rupN original/log.h new/log.h
+--- original/log.h	1970-01-01 01:00:00.000000000 +0100
++++ new/log.h	2012-10-31 13:23:46.820326748 +0000
+@@ -0,0 +1,24 @@
++#ifndef log_h
++#define log_h
++
++#include <string>
++#include <vector>
++
++
++class acceptor;
++
++class log {
++ private:
++  std::string name;
++  acceptor *pxs;
++ public:
++  log (acceptor*, std::string _me);
++  std::string dump();
++  void restore(std::string s);
++  void logread(void);
++  void loginstance(unsigned instance, std::string v);
++  void loghigh(prop_t n_h);
++  void logprop(prop_t n_a, std::string v);
++};
++
++#endif /* log_h */
+diff -rupN original/paxos.cc new/paxos.cc
+--- original/paxos.cc	1970-01-01 01:00:00.000000000 +0100
++++ new/paxos.cc	2012-10-31 13:23:46.820326748 +0000
+@@ -0,0 +1,298 @@
++#include "paxos.h"
++#include "handle.h"
++// #include <signal.h>
++#include <stdio.h>
++
++// This module implements the proposer and acceptor of the Paxos
++// distributed algorithm as described by Lamport's "Paxos Made
++// Simple".  To kick off an instance of Paxos, the caller supplies a
++// list of nodes, a proposed value, and invokes the proposer.  If the
++// majority of the nodes agree on the proposed value after running
++// this instance of Paxos, the acceptor invokes the upcall
++// paxos_commit to inform higher layers of the agreed value for this
++// instance.
++
++
++bool
++operator> (const prop_t &a, const prop_t &b)
++{
++  return (a.n > b.n || (a.n == b.n && a.m > b.m));
++}
++
++bool
++operator>= (const prop_t &a, const prop_t &b)
++{
++  return (a.n > b.n || (a.n == b.n && a.m >= b.m));
++}
++
++std::string
++print_members(const std::vector<std::string> &nodes)
++{
++  std::string s;
++  s.clear();
++  for (unsigned i = 0; i < nodes.size(); i++) {
++    s += nodes[i];
++    if (i < (nodes.size()-1))
++      s += ",";
++  }
++  return s;
++}
++
++bool isamember(std::string m, const std::vector<std::string> &nodes)
++{
++  for (unsigned i = 0; i < nodes.size(); i++) {
++    if (nodes[i] == m) return 1;
++  }
++  return 0;
++}
++
++bool
++proposer::isrunning()
++{
++  bool r;
++  assert(pthread_mutex_lock(&pxs_mutex)==0);
++  r = !stable;
++  assert(pthread_mutex_unlock(&pxs_mutex)==0);
++  return r;
++}
++
++// check if the servers in l2 contains a majority of servers in l1
++bool
++proposer::majority(const std::vector<std::string> &l1, 
++		const std::vector<std::string> &l2)
++{
++  unsigned n = 0;
++
++  for (unsigned i = 0; i < l1.size(); i++) {
++    if (isamember(l1[i], l2))
++      n++;
++  }
++  return n >= (l1.size() >> 1) + 1;
++}
++
++proposer::proposer(class paxos_change *_cfg, class acceptor *_acceptor, 
++		   std::string _me)
++  : cfg(_cfg), acc (_acceptor), me (_me), break1 (false), break2 (false), 
++    stable (true)
++{
++  assert (pthread_mutex_init(&pxs_mutex, NULL) == 0);
++
++}
++
++void
++proposer::setn()
++{
++  my_n.n = acc->get_n_h().n + 1 > my_n.n + 1 ? acc->get_n_h().n + 1 : my_n.n + 1;
++}
++
++bool
++proposer::run(int instance, std::vector<std::string> newnodes, std::string newv)
++{
++  std::vector<std::string> accepts;
++  std::vector<std::string> nodes;
++  std::vector<std::string> nodes1;
++  std::string v;
++  bool r = false;
++
++  pthread_mutex_lock(&pxs_mutex);
++  printf("start: initiate paxos for %s w. i=%d v=%s stable=%d\n",
++	 print_members(newnodes).c_str(), instance, newv.c_str(), stable);
++  if (!stable) {  // already running proposer?
++    printf("proposer::run: already running\n");
++    pthread_mutex_unlock(&pxs_mutex);
++    return false;
++  }
++  setn();
++  accepts.clear();
++  nodes.clear();
++  v.clear();
++  nodes = c_nodes;
++  if (prepare(instance, accepts, nodes, v)) {
++
++    if (majority(c_nodes, accepts)) {
++      printf("paxos::manager: received a majority of prepare responses\n");
++
++      if (v.size() == 0) {
++	v = c_v;
++      }
++
++      breakpoint1();
++
++      nodes1 = accepts;
++      accepts.clear();
++      accept(instance, accepts, nodes1, v);
++
++      if (majority(c_nodes, accepts)) {
++	printf("paxos::manager: received a majority of accept responses\n");
++
++	breakpoint2();
++
++	decide(instance, accepts, v);
++	r = true;
++      } else {
++	printf("paxos::manager: no majority of accept responses\n");
++      }
++    } else {
++      printf("paxos::manager: no majority of prepare responses\n");
++    }
++  } else {
++    printf("paxos::manager: prepare is rejected %d\n", stable);
++  }
++  stable = true;
++  pthread_mutex_unlock(&pxs_mutex);
++  return r;
++}
++
++bool
++proposer::prepare(unsigned instance, std::vector<std::string> &accepts, 
++         std::vector<std::string> nodes,
++         std::string &v)
++{
++  return false;
++}
++
++
++void
++proposer::accept(unsigned instance, std::vector<std::string> &accepts,
++        std::vector<std::string> nodes, std::string v)
++{
++}
++
++void
++proposer::decide(unsigned instance, std::vector<std::string> accepts, 
++	      std::string v)
++{
++}
++
++acceptor::acceptor(class paxos_change *_cfg, bool _first, std::string _me, 
++	     std::string _value)
++  : cfg(_cfg), me (_me), instance_h(0)
++{
++  assert (pthread_mutex_init(&pxs_mutex, NULL) == 0);
++
++  n_h.n = 0;
++  n_h.m = me;
++  n_a.n = 0;
++  n_a.m = me;
++  v_a.clear();
++
++  l = new log (this, me);
++
++  if (instance_h == 0 && _first) {
++    values[1] = _value;
++    l->loginstance(1, _value);
++    instance_h = 1;
++  }
++
++  pxs = new rpcs(atoi(_me.c_str()));
++  pxs->reg(paxos_protocol::preparereq, this, &acceptor::preparereq);
++  pxs->reg(paxos_protocol::acceptreq, this, &acceptor::acceptreq);
++  pxs->reg(paxos_protocol::decidereq, this, &acceptor::decidereq);
++}
++
++paxos_protocol::status
++acceptor::preparereq(std::string src, paxos_protocol::preparearg a,
++    paxos_protocol::prepareres &r)
++{
++  // handle a preparereq message from proposer
++  return paxos_protocol::OK;
++
++}
++
++paxos_protocol::status
++acceptor::acceptreq(std::string src, paxos_protocol::acceptarg a, int &r)
++{
++
++  // handle an acceptreq message from proposer
++
++  return paxos_protocol::OK;
++}
++
++paxos_protocol::status
++acceptor::decidereq(std::string src, paxos_protocol::decidearg a, int &r)
++{
++
++  // handle an decide message from proposer
++
++  return paxos_protocol::OK;
++}
++
++void
++acceptor::commit_wo(unsigned instance, std::string value)
++{
++  //assume pxs_mutex is held
++  printf("acceptor::commit: instance=%d has v= %s\n", instance, value.c_str());
++  if (instance > instance_h) {
++    printf("commit: highestaccepteinstance = %d\n", instance);
++    values[instance] = value;
++    l->loginstance(instance, value);
++    instance_h = instance;
++    n_h.n = 0;
++    n_h.m = me;
++    n_a.n = 0;
++    n_a.m = me;
++    v_a.clear();
++    if (cfg) {
++      pthread_mutex_unlock(&pxs_mutex);
++      cfg->paxos_commit(instance, value);
++      pthread_mutex_lock(&pxs_mutex);
++    }
++  }
++}
++
++void
++acceptor::commit(unsigned instance, std::string value)
++{
++  pthread_mutex_lock(&pxs_mutex);
++  commit_wo(instance, value);
++  pthread_mutex_unlock(&pxs_mutex);
++}
++
++std::string
++acceptor::dump()
++{
++  return l->dump();
++}
++
++void
++acceptor::restore(std::string s)
++{
++  l->restore(s);
++  l->logread();
++}
++
++
++
++// For testing purposes
++
++// Call this from your code between phases prepare and accept of proposer
++void
++proposer::breakpoint1()
++{
++  if (break1) {
++    printf("Dying at breakpoint 1!\n");
++    exit(1);
++  }
++}
++
++// Call this from your code between phases accept and decide of proposer
++void
++proposer::breakpoint2()
++{
++  if (break2) {
++    printf("Dying at breakpoint 2!\n");
++    exit(1);
++  }
++}
++
++void
++proposer::breakpoint(int b)
++{
++  if (b == 3) {
++    printf("Proposer: breakpoint 1\n");
++    break1 = true;
++  } else if (b == 4) {
++    printf("Proposer: breakpoint 2\n");
++    break2 = true;
++  }
++}
+diff -rupN original/paxos.h new/paxos.h
+--- original/paxos.h	1970-01-01 01:00:00.000000000 +0100
++++ new/paxos.h	2012-10-31 13:23:46.824326765 +0000
+@@ -0,0 +1,101 @@
++#ifndef paxos_h
++#define paxos_h
++
++#include <string>
++#include <vector>
++#include "rpc.h"
++#include "paxos_protocol.h"
++#include "log.h"
++
++
++class paxos_change {
++ public:
++  virtual void paxos_commit(unsigned instance, std::string v) = 0;
++  virtual ~paxos_change() {};
++};
++
++class acceptor {
++ private:
++  log *l;
++  rpcs *pxs;
++  paxos_change *cfg;
++  std::string me;
++  pthread_mutex_t pxs_mutex;
++
++  // Acceptor state
++  prop_t n_h;		// number of the highest proposal seen in a prepare
++  prop_t n_a;		// number of highest proposal accepted
++  std::string v_a;	// value of highest proposal accepted
++  unsigned instance_h;	// number of the highest instance we have decided
++  std::map<unsigned,std::string> values;	// vals of each instance
++
++  void commit_wo(unsigned instance, std::string v);
++  paxos_protocol::status preparereq(std::string src, 
++          paxos_protocol::preparearg a,
++          paxos_protocol::prepareres &r);
++  paxos_protocol::status acceptreq(std::string src, 
++          paxos_protocol::acceptarg a, int &r);
++  paxos_protocol::status decidereq(std::string src, 
++          paxos_protocol::decidearg a, int &r);
++
++  friend class log;
++
++ public:
++  acceptor(class paxos_change *cfg, bool _first, std::string _me, 
++	std::string _value);
++  ~acceptor() {};
++  void commit(unsigned instance, std::string v);
++  unsigned instance() { return instance_h; }
++  std::string value(unsigned instance) { return values[instance]; }
++  std::string dump();
++  void restore(std::string);
++  rpcs *get_rpcs() { return pxs; };
++  prop_t get_n_h() { return n_h; };
++  unsigned get_instance_h() { return instance_h; };
++};
++
++extern bool isamember(std::string m, const std::vector<std::string> &nodes);
++extern std::string print_members(const std::vector<std::string> &nodes);
++
++class proposer {
++ private:
++  log *l;
++  paxos_change *cfg;
++  acceptor *acc;
++  std::string me;
++  bool break1;
++  bool break2;
++
++  pthread_mutex_t pxs_mutex;
++
++  // Proposer state
++  bool stable;
++  std::vector<std::string> c_nodes;	// nodes in this instance
++  std::string c_v;	// value we would like to propose
++  prop_t my_n;		// number of the last proposal used in this instance
++
++  void setn();
++  bool prepare(unsigned instance, std::vector<std::string> &accepts, 
++         std::vector<std::string> nodes,
++         std::string &v);
++  void accept(unsigned instance, std::vector<std::string> &accepts, 
++        std::vector<std::string> nodes, std::string v);
++  void decide(unsigned instance, std::vector<std::string> accepts,
++        std::string v);
++
++  void breakpoint1();
++  void breakpoint2();
++  bool majority(const std::vector<std::string> &l1, const std::vector<std::string> &l2);
++
++  friend class log;
++ public:
++  proposer(class paxos_change *cfg, class acceptor *_acceptor, std::string _me);
++  ~proposer() {};
++  bool run(int instance, std::vector<std::string> nodes, std::string v);
++  bool isrunning();
++  void breakpoint(int b);
++};
++
++
++
++#endif /* paxos_h */
+diff -rupN original/paxos_protocol.h new/paxos_protocol.h
+--- original/paxos_protocol.h	1970-01-01 01:00:00.000000000 +0100
++++ new/paxos_protocol.h	2012-10-31 13:23:46.824326765 +0000
+@@ -0,0 +1,136 @@
++#ifndef paxos_protocol_h
++#define paxos_protocol_h
++
++#include "rpc.h"
++
++struct prop_t {
++  unsigned n;
++  std::string m;
++};
++
++class paxos_protocol {
++ public:
++  enum xxstatus { OK, ERR };
++  typedef int status;
++  enum rpc_numbers {
++    preparereq = 0x11001,
++    acceptreq,
++    decidereq,
++    heartbeat,
++  };
++
++  struct preparearg {
++    unsigned instance;
++    prop_t n;
++    std::string v;
++  };
++
++  struct prepareres {
++    int oldinstance;
++    int accept;
++    prop_t n_a;
++    std::string v_a;
++  };
++
++  struct acceptarg {
++    unsigned instance;
++    prop_t n;
++    std::string v;
++  };
++
++  struct decidearg {
++    unsigned instance;
++    std::string v;
++  };
++
++};
++
++inline unmarshall &
++operator>>(unmarshall &u, prop_t &a)
++{
++  u >> a.n;
++  u >> a.m;
++  return u;
++}
++
++inline marshall &
++operator<<(marshall &m, prop_t a)
++{
++  m << a.n;
++  m << a.m;
++  return m;
++}
++
++inline unmarshall &
++operator>>(unmarshall &u, paxos_protocol::preparearg &a)
++{
++  u >> a.instance;
++  u >> a.n;
++  u >> a.v;
++  return u;
++}
++
++inline marshall &
++operator<<(marshall &m, paxos_protocol::preparearg a)
++{
++  m << a.instance;
++  m << a.n;
++  m << a.v;
++  return m;
++}
++
++inline unmarshall &
++operator>>(unmarshall &u, paxos_protocol::prepareres &r)
++{
++  u >> r.oldinstance;
++  u >> r.accept;
++  u >> r.n_a;
++  u >> r.v_a;
++  return u;
++}
++
++inline marshall &
++operator<<(marshall &m, paxos_protocol::prepareres r)
++{
++  m << r.oldinstance;
++  m << r.accept;
++  m << r.n_a;
++  m << r.v_a;
++  return m;
++}
++
++inline unmarshall &
++operator>>(unmarshall &u, paxos_protocol::acceptarg &a)
++{
++  u >> a.instance;
++  u >> a.n;
++  u >> a.v;
++  return u;
++}
++
++inline marshall &
++operator<<(marshall &m, paxos_protocol::acceptarg a)
++{
++  m << a.instance;
++  m << a.n;
++  m << a.v;
++  return m;
++}
++
++inline unmarshall &
++operator>>(unmarshall &u, paxos_protocol::decidearg &a)
++{
++  u >> a.instance;
++  u >> a.v;
++  return u;
++}
++
++inline marshall &
++operator<<(marshall &m, paxos_protocol::decidearg a)
++{
++  m << a.instance;
++  m << a.v;
++  return m;
++}
++
++#endif
+diff -rupN original/rpc/marshall.h new/rpc/marshall.h
+--- original/rpc/marshall.h	2012-10-31 13:11:59.636819845 +0000
++++ new/rpc/marshall.h	2012-10-31 16:00:09.746854159 +0000
+@@ -67,10 +67,14 @@ class marshall {
+ 		void rawbyte(unsigned char);
+ 		void rawbytes(const char *, int);
+ 
+-		// Return the current contents (including header) as a string
+-		const std::string str() const {
+-			std::string tmps = std::string(_buf,_ind);
+-			return tmps;
++		// Return the current content (excluding header) as a string
++		std::string get_content() { 
++			return std::string(_buf+RPC_HEADER_SZ,_ind-RPC_HEADER_SZ);
++		}
++
++		// Return the current content (excluding header) as a string
++		std::string str() {
++			return get_content();
+ 		}
+ 
+ 		void pack(int i);
+@@ -128,11 +132,28 @@ class unmarshall {
+ 	public:
+ 		unmarshall(): _buf(NULL),_sz(0),_ind(0),_ok(false) {}
+ 		unmarshall(char *b, int sz): _buf(b),_sz(sz),_ind(),_ok(true) {}
++		unmarshall(const std::string &s) : _buf(NULL),_sz(0),_ind(0),_ok(false) 
++		{
++			//take the content which does not exclude a RPC header from a string
++			take_content(s);
++		}
+ 		~unmarshall() {
+ 			if (_buf) free(_buf);
+ 		}
++
+ 		//take contents from another unmarshall object
+ 		void take_in(unmarshall &another);
++
++		//take the content which does not exclude a RPC header from a string
++		void take_content(const std::string &s) {
++			_sz = s.size()+RPC_HEADER_SZ;
++			_buf = (char *)realloc(_buf,_sz);
++			assert(_buf);
++			_ind = RPC_HEADER_SZ;
++			memcpy(_buf+_ind, s.data(), s.size());
++			_ok = true;
++		}
++
+ 		bool ok() { return _ok; }
+ 		char *cstr() { return _buf;}
+ 		bool okdone();
+diff -rupN original/rpc/rpc.cc new/rpc/rpc.cc
+--- original/rpc/rpc.cc	2012-10-31 13:11:59.636819845 +0000
++++ new/rpc/rpc.cc	2012-10-31 16:00:09.746854159 +0000
+@@ -99,10 +99,11 @@ void set_rand_seed()
+ 
+ rpcc::rpcc(sockaddr_in d, bool retrans) : 
+ 	dst_(d), srv_nonce_(0), bind_done_(false), xid_(1), lossytest_(0), 
+-	retrans_(retrans), chan_(NULL)
++	retrans_(retrans), reachable_(true), chan_(NULL), destroy_wait_ (false)
+ {
+ 	assert(pthread_mutex_init(&m_, 0) == 0);
+ 	assert(pthread_mutex_init(&chan_m_, 0) == 0);
++	assert(pthread_cond_init(&destroy_wait_c_, 0) == 0);
+ 
+ 	if (retrans) {
+ 		set_rand_seed();
+@@ -157,6 +158,32 @@ rpcc::bind(TO to)
+ 	return ret;
+ };
+ 
++// Cancel all outstanding calls
++void
++rpcc::cancel(void)
++{
++  ScopedLock ml(&m_);
++  printf("rpcc::cancel: force callers to fail\n");
++  std::map<int,caller*>::iterator iter;
++  for(iter = calls_.begin(); iter != calls_.end(); iter++){
++    caller *ca = iter->second;
++
++    jsl_log(JSL_DBG_2, "rpcc::cancel: force caller to fail\n");
++    {
++      ScopedLock cl(&ca->m);
++      ca->done = true;
++      ca->intret = rpc_const::cancel_failure;
++      assert(pthread_cond_signal(&ca->c) == 0);
++    }
++  }
++
++  while (calls_.size () > 0) {
++    destroy_wait_ = true;
++    assert(pthread_cond_wait(&destroy_wait_c_,&m_) == 0);
++  }
++  printf("rpcc::cancel: done\n");
++}
++
+ int
+ rpcc::call1(unsigned int proc, marshall &req, unmarshall &rep,
+ 		TO to)
+@@ -172,6 +199,10 @@ rpcc::call1(unsigned int proc, marshall
+ 			return rpc_const::bind_failure;
+ 		}
+ 
++		if (destroy_wait_) {
++		  return rpc_const::cancel_failure;
++		}
++
+ 		ca.xid = xid_++;
+ 		calls_[ca.xid] = &ca;
+ 
+@@ -195,7 +226,8 @@ rpcc::call1(unsigned int proc, marshall
+ 		if (transmit) {
+ 			get_refconn(&ch);
+ 			if (ch) {
+-				ch->send(req.cstr(), req.size());
++			        if (reachable_) ch->send(req.cstr(), req.size());
++				else jsl_log(JSL_DBG_1, "not reachable\n");
+ 				jsl_log(JSL_DBG_2, 
+ 						"rpcc::call1 %u just sent req proc %x xid %u clt_nonce %d\n", 
+ 						clt_nonce_, proc, ca.xid, clt_nonce_); 
+@@ -216,11 +248,16 @@ rpcc::call1(unsigned int proc, marshall
+ 		{
+ 			ScopedLock cal(&ca.m);
+ 			while (!ca.done) {
+-				if (pthread_cond_timedwait(&ca.c, &ca.m, &nextdeadline) == ETIMEDOUT)
++			        jsl_log(JSL_DBG_2, "rpcc:call1: wait\n");
++				if (pthread_cond_timedwait(&ca.c, &ca.m, &nextdeadline) == ETIMEDOUT) {
++				  	jsl_log(JSL_DBG_2, "rpcc::call1: timeout\n");
+ 					break;
++				}
+ 			}
+-			if (ca.done)
++			if (ca.done) {
++			        jsl_log(JSL_DBG_2, "rpcc::call1: reply received\n");
+ 				break;
++			}
+ 		}
+ 
+ 		if (retrans_ && (!ch || ch->isdead())) {
+@@ -237,12 +274,16 @@ rpcc::call1(unsigned int proc, marshall
+ 		// packet times out before it's even sent by the channel.  nasty.
+ 		// but I don't think there's any harm in potentially doing it twice
+ 		update_xid_rep(ca.xid);
++
++		if (destroy_wait_) {
++		  assert(pthread_cond_signal(&destroy_wait_c_) == 0);
++		}
+ 	}
+ 
+ 	ScopedLock cal(&ca.m);
+ 
+ 	jsl_log(JSL_DBG_2, 
+-			"rpcc::call1 %u wait over for req proc %x xid %u %s:%d done? %d ret %d \n", 
++			"rpcc::call1 %u call done for req proc %x xid %u %s:%d done? %d ret %d \n", 
+ 			clt_nonce_, proc, ca.xid, inet_ntoa(dst_.sin_addr),
+ 			ntohs(dst_.sin_port), ca.done, ca.intret);
+ 
+@@ -340,7 +381,7 @@ compress:
+ 
+ 
+ rpcs::rpcs(unsigned int p1, int count)
+-: port_(p1), counting_(count), curr_counts_(count), lossytest_(0)
++  : port_(p1), counting_(count), curr_counts_(count), lossytest_(0), reachable_ (true)
+ {
+ 	assert(pthread_mutex_init(&procs_m_, 0) == 0);
+ 	assert(pthread_mutex_init(&count_m_, 0) == 0);
+@@ -373,10 +414,15 @@ rpcs::~rpcs()
+ bool
+ rpcs::got_pdu(connection *c, char *b, int sz)
+ {
++        if (!reachable_) {
++            jsl_log(JSL_DBG_1, "rpcss::got_pdu: not reachable\n");
++            return true;
++        }
++
+ 	djob_t *j = new djob_t(c, b, sz);
+ 	c->incref();
+ 	bool succ = dispatchpool_->addObjJob(this, &rpcs::dispatch, j);
+-	if (!succ) {
++	if (!succ || !reachable_) {
+ 		c->decref();
+ 		delete j;
+ 	}
+diff -rupN original/rpc/rpc.h new/rpc/rpc.h
+--- original/rpc/rpc.h	2012-10-31 13:11:59.636819845 +0000
++++ new/rpc/rpc.h	2012-10-31 16:00:09.746854159 +0000
+@@ -23,6 +23,7 @@ class rpc_const {
+ 		static const int atmostonce_failure = -4;
+ 		static const int oldsrv_failure = -5;
+ 		static const int bind_failure = -6;
++		static const int cancel_failure = -7;
+ };
+ 
+ // rpc client endpoint.
+@@ -56,12 +57,16 @@ class rpcc : public chanmgr {
+ 		unsigned int xid_;
+ 		int lossytest_;
+ 		bool retrans_;
++		bool reachable_;
+ 
+ 		connection *chan_;
+ 
+ 		pthread_mutex_t m_; // protect insert/delete to calls[]
+ 		pthread_mutex_t chan_m_;
+ 
++		bool destroy_wait_;
++		pthread_cond_t destroy_wait_c_;
++
+ 		std::map<int, caller *> calls_;
+ 		std::list<unsigned int> xid_rep_window_;
+ 
+@@ -81,6 +86,10 @@ class rpcc : public chanmgr {
+ 
+ 		int bind(TO to = to_max);
+ 
++		void set_reachable(bool r) { reachable_ = r; }
++
++		void cancel();
++
+ 		int call1(unsigned int proc, 
+ 				marshall &req, unmarshall &rep, TO to);
+ 
+@@ -286,6 +295,7 @@ class rpcs : public chanmgr {
+ 	std::map<int, int> counts_;
+ 
+ 	int lossytest_; 
++	bool reachable_;
+ 
+ 	// map proc # to function
+ 	std::map<int, handler *> procs_;
+@@ -319,6 +329,8 @@ class rpcs : public chanmgr {
+ 	//RPC handler for clients binding
+ 	int rpcbind(int a, int &r);
+ 
++	void set_reachable(bool r) { reachable_ = r; }
++
+ 	bool got_pdu(connection *c, char *b, int sz);
+ 
+ 	// register a handler
+diff -rupN original/rsm.cc new/rsm.cc
+--- original/rsm.cc	1970-01-01 01:00:00.000000000 +0100
++++ new/rsm.cc	2012-10-31 13:23:46.824326765 +0000
+@@ -0,0 +1,449 @@
++//
++// Replicated state machine implementation with a primary and several
++// backups. The primary receives requests, assigns each a view stamp (a
++// vid, and a sequence number) in the order of reception, and forwards
++// them to all backups. A backup executes requests in the order of that
++// the primary stamps them and replies with an OK to the primary. The
++// primary executes the request after it receives OKs from all backups,
++// and sends the reply back to the client.
++//
++// The config module will tell the RSM about a new view. If the
++// primary in the previous view is a member of the new view, then it
++// will stay the primary.  Otherwise, the smallest numbered node of
++// the previous view will be the new primary.  In either case, the new
++// primary will be a node from the previous view.  The configuration
++// module constructs the sequence of views for the RSM and the RSM
++// ensures there will be always one primary, who was a member of the
++// last view.
++//
++// When a new node starts, the recovery thread is in charge of joining
++// the RSM.  It will collect the internal RSM state from the primary;
++// the primary asks the config module to add the new node and returns
++// to the joining the internal RSM state (e.g., paxos log). Since
++// there is only one primary, all joins happen in well-defined total
++// order.
++//
++// The recovery thread also runs during a view change (e.g, when a node
++// has failed).  After a failure some of the backups could have
++// processed a request that the primary has not, but those results are
++// not visible to clients (since the primary responds).  If the
++// primary of the previous view is in the current view, then it will
++// be the primary and its state is authoritive: the backups download
++// from the primary the current state.  A primary waits until all
++// backups have downloaded the state.  Once the RSM is in sync, the
++// primary accepts requests again from clients.  If one of the backups
++// is the new primary, then its state is authoritative.  In either
++// scenario, the next view uses a node as primary that has the state
++// resulting from processing all acknowledged client requests.
++// Therefore, if the nodes sync up before processing the next request,
++// the next view will have the correct state.
++//
++// While the RSM in a view change (i.e., a node has failed, a new view
++// has been formed, but the sync hasn't completed), another failure
++// could happen, which complicates a view change.  During syncing the
++// primary or backups can timeout, and initiate another Paxos round.
++// There are 2 variables that RSM uses to keep track in what state it
++// is:
++//    - inviewchange: a node has failed and the RSM is performing a view change
++//    - insync: this node is syncing its state
++//
++// If inviewchange is false and a node is the primary, then it can
++// process client requests. If it is true, clients are told to retry
++// later again.  While inviewchange is true, the RSM may go through several
++// member list changes, one by one.   After a member list
++// change completes, the nodes tries to sync. If the sync complets,
++// the view change completes (and inviewchange is set to false).  If
++// the sync fails, the node may start another member list change
++// (inviewchange = true and insync = false).
++//
++// The implementation should be used only with servers that run all
++// requests run to completion; in particular, a request shouldn't
++// block.  If a request blocks, the backup won't respond to the
++// primary, and the primary won't execute the request.  A request may
++// send an RPC to another host, but the RPC should be a one-way
++// message to that host; the backup shouldn't do anything based on the
++// response or execute after the response, because it is not
++// guaranteed that all backup will receive the same response and
++// execute in the same order.
++//
++// The implementation can be viewed as a layered system:
++//       RSM module     ---- in charge of replication
++//       config module  ---- in charge of view management
++//       Paxos module   ---- in charge of running Paxos to agree on a value
++//
++// Each module has threads and internal locks. Furthermore, a thread
++// may call down through the layers (e.g., to run Paxos's proposer).
++// When Paxos's acceptor accepts a new value for an instance, a thread
++// will invoke an upcall to inform higher layers of the new value.
++// The rule is that a module releases its internal locks before it
++// upcalls, but can keep its locks when calling down.
++
++#include <fstream>
++#include <iostream>
++
++#include "handle.h"
++#include "rsm.h"
++
++static void *
++recoverythread(void *x)
++{
++  rsm *r = (rsm *) x;
++  r->recovery();
++  return 0;
++}
++
++
++
++rsm::rsm(std::string _first, std::string _me) 
++  : stf(0), primary(_first), insync (false), inviewchange (false), nbackup (0), partitioned (false), dopartition(false), break1(false), break2(false)
++{
++  pthread_t th;
++
++  last_myvs.vid = 0;
++  last_myvs.seqno = 0;
++  myvs = last_myvs;
++  myvs.seqno = 1;
++
++  pthread_mutex_init(&rsm_mutex, NULL);
++  pthread_mutex_init(&invoke_mutex, NULL);
++  pthread_cond_init(&recovery_cond, NULL);
++  pthread_cond_init(&sync_cond, NULL);
++  pthread_cond_init(&join_cond, NULL);
++
++  cfg = new config(_first, _me, this);
++
++  rsmrpc = cfg->get_rpcs();
++  rsmrpc->reg(rsm_client_protocol::invoke, this, &rsm::client_invoke);
++  rsmrpc->reg(rsm_client_protocol::members, this, &rsm::client_members);
++  rsmrpc->reg(rsm_protocol::invoke, this, &rsm::invoke);
++  rsmrpc->reg(rsm_protocol::transferreq, this, &rsm::transferreq);
++  rsmrpc->reg(rsm_protocol::transferdonereq, this, &rsm::transferdonereq);
++  rsmrpc->reg(rsm_protocol::joinreq, this, &rsm::joinreq);
++
++  // tester must be on different port, otherwise it may partition itself
++  testsvr = new rpcs(atoi(_me.c_str()) + 1);
++  testsvr->reg(rsm_test_protocol::net_repair, this, &rsm::test_net_repairreq);
++  testsvr->reg(rsm_test_protocol::breakpoint, this, &rsm::breakpointreq);
++
++  assert(pthread_mutex_lock(&rsm_mutex)==0);
++
++  assert(pthread_create(&th, NULL, &recoverythread, (void *) this) == 0);
++
++  assert(pthread_mutex_unlock(&rsm_mutex)==0);
++}
++
++
++// The recovery thread runs this function
++void
++rsm::recovery()
++{
++  bool r = false;
++
++  assert(pthread_mutex_lock(&rsm_mutex)==0);
++
++  while (1) {
++    while (!cfg->ismember(cfg->myaddr())) {
++      if (join(primary)) {
++	printf("recovery: joined\n");
++      } else {
++	assert(pthread_mutex_unlock(&rsm_mutex)==0);
++	sleep (30); // XXX make another node in cfg primary?
++	assert(pthread_mutex_lock(&rsm_mutex)==0);
++      }
++    }
++
++    if (r) inviewchange = false;
++    printf("recovery: go to sleep %d %d\n", insync, inviewchange);
++    pthread_cond_wait(&recovery_cond, &rsm_mutex);
++  }
++  assert(pthread_mutex_unlock(&rsm_mutex)==0);
++}
++
++bool
++rsm::sync_with_backups()
++{
++  // For lab 8
++  return true;
++}
++
++
++bool
++rsm::sync_with_primary()
++{
++  // For lab 8
++  return true;
++}
++
++
++/**
++ * Call to transfer state from m to the local node.
++ * Assumes that rsm_mutex is already held.
++ */
++bool
++rsm::statetransfer(std::string m)
++{
++  // For lab 8
++  return true;
++}
++
++bool
++rsm::statetransferdone(std::string m) {
++  // For lab 8
++  return true;
++}
++
++
++bool
++rsm::join(std::string m) {
++  handle h(m);
++  int ret ;
++  rsm_protocol::joinres r;
++
++  if (h.get_rpcc() != 0) {
++    printf("rsm::join: %s mylast (%d,%d)\n", m.c_str(), last_myvs.vid, 
++	   last_myvs.seqno);
++    assert(pthread_mutex_unlock(&rsm_mutex)==0);
++    ret = h.get_rpcc()->call(rsm_protocol::joinreq, cfg->myaddr(), last_myvs, 
++			     r, rpcc::to(120000));
++    assert(pthread_mutex_lock(&rsm_mutex)==0);
++  }
++  if (h.get_rpcc() == 0 || ret != rsm_protocol::OK) {
++    printf("rsm::join: couldn't reach %s %p %d\n", m.c_str(), 
++	   h.get_rpcc(), ret);
++    return false;
++  }
++  printf("rsm::join: succeeded %s\n", r.log.c_str());
++  cfg->restore(r.log);
++  return true;
++}
++
++
++/*
++ * Config informs rsm whenever it has successfully 
++ * completed a view change
++ */
++
++void 
++rsm::commit_change() 
++{
++  pthread_mutex_lock(&rsm_mutex);
++  // Lab 7:
++  // - If I am not part of the new view, start recovery
++  pthread_mutex_unlock(&rsm_mutex);
++}
++
++
++
++//
++// Clients call client_invoke to invoke a procedure on the replicated state
++// machine: the primary receives the request, assigns it a sequence
++// number, and invokes it on all members of the replicated state
++// machine.
++//
++rsm_client_protocol::status
++rsm::client_invoke(int procno, std::string req, std::string &r)
++{
++  int ret = rsm_protocol::OK;
++  // For lab 8
++  return ret;
++}
++
++// 
++// The primary calls the internal invoke at each member of the
++// replicated state machine 
++//
++// the replica must execute requests in order (with no gaps) 
++// according to requests' seqno 
++
++rsm_protocol::status
++rsm::invoke(int proc, viewstamp vs, std::string req, int &dummy)
++{
++  rsm_protocol::status ret = rsm_protocol::OK;
++  // For lab 8
++  return ret;
++}
++
++/**
++ * RPC handler: Send back the local node's state to the caller
++ */
++rsm_protocol::status
++rsm::transferreq(std::string src, viewstamp last, rsm_protocol::transferres &r)
++{
++  assert(pthread_mutex_lock(&rsm_mutex)==0);
++  int ret = rsm_protocol::OK;
++  // For lab 8
++  assert(pthread_mutex_unlock(&rsm_mutex)==0);
++  return ret;
++}
++
++/**
++  * RPC handler: Send back the local node's latest viewstamp
++  */
++rsm_protocol::status
++rsm::transferdonereq(std::string m, int &r)
++{
++  int ret = rsm_client_protocol::OK;
++  assert (pthread_mutex_lock(&rsm_mutex) == 0);
++  // For lab 8
++  assert (pthread_mutex_unlock(&rsm_mutex) == 0);
++  return ret;
++}
++
++rsm_protocol::status
++rsm::joinreq(std::string m, viewstamp last, rsm_protocol::joinres &r)
++{
++  int ret = rsm_client_protocol::OK;
++
++  assert (pthread_mutex_lock(&rsm_mutex) == 0);
++  printf("joinreq: src %s last (%d,%d) mylast (%d,%d)\n", m.c_str(), 
++	 last.vid, last.seqno, last_myvs.vid, last_myvs.seqno);
++  if (cfg->ismember(m)) {
++    printf("joinreq: is still a member\n");
++    r.log = cfg->dump();
++  } else if (cfg->myaddr() != primary) {
++    printf("joinreq: busy\n");
++    ret = rsm_client_protocol::BUSY;
++  } else {
++    // Lab 7: invoke config to create a new view that contains m
++  }
++  assert (pthread_mutex_unlock(&rsm_mutex) == 0);
++  return ret;
++}
++
++/*
++ * RPC handler: Send back all the nodes this local knows about to client
++ * so the client can switch to a different primary 
++ * when it existing primary fails
++ */
++rsm_client_protocol::status
++rsm::client_members(int i, std::vector<std::string> &r)
++{
++  std::vector<std::string> m;
++  assert(pthread_mutex_lock(&rsm_mutex)==0);
++  m = cfg->get_curview();
++  m.push_back(primary);
++  r = m;
++  printf("rsm::client_members return %s m %s\n", cfg->print_curview().c_str(),
++	 primary.c_str());
++  assert(pthread_mutex_unlock(&rsm_mutex)==0);
++  return rsm_protocol::OK;
++}
++
++// if primary is member of new view, that node is primary
++// otherwise, the lowest number node of the previous view.
++// caller should hold rsm_mutex
++void
++rsm::set_primary()
++{
++  std::vector<std::string> c = cfg->get_curview();
++  std::vector<std::string> p = cfg->get_prevview();
++  assert (c.size() > 0);
++
++  if (isamember(primary,c)) {
++    printf("set_primary: primary stays %s\n", primary.c_str());
++    return;
++  }
++
++  assert(p.size() > 0);
++  for (unsigned i = 0; i < p.size(); i++) {
++    if (isamember(p[i], c)) {
++      primary = p[i];
++      printf("set_primary: primary is %s\n", primary.c_str());
++      return;
++    }
++  }
++  assert(0);
++}
++
++// Assume caller holds rsm_mutex
++bool
++rsm::amiprimary_wo()
++{
++  return primary == cfg->myaddr() && !inviewchange;
++}
++
++bool
++rsm::amiprimary()
++{
++  assert(pthread_mutex_lock(&rsm_mutex)==0);
++  bool r = amiprimary_wo();
++  assert(pthread_mutex_unlock(&rsm_mutex)==0);
++  return r;
++}
++
++
++// Testing server
++
++// Simulate partitions
++
++// assumes caller holds rsm_mutex
++void
++rsm::net_repair_wo(bool heal)
++{
++  std::vector<std::string> m;
++  m = cfg->get_curview();
++  for (unsigned i  = 0; i < m.size(); i++) {
++    if (m[i] != cfg->myaddr()) {
++        handle h(m[i]);
++	printf("rsm::net_repair_wo: %s %d\n", m[i].c_str(), heal);
++	if (h.get_rpcc()) h.get_rpcc()->set_reachable(heal);
++    }
++  }
++  rsmrpc->set_reachable(heal);
++}
++
++rsm_test_protocol::status 
++rsm::test_net_repairreq(int heal, int &r)
++{
++  assert(pthread_mutex_lock(&rsm_mutex)==0);
++  printf("rsm::test_net_repairreq: %d (dopartition %d, partitioned %d)\n", 
++	 heal, dopartition, partitioned);
++  if (heal) {
++    net_repair_wo(heal);
++    partitioned = false;
++  } else {
++    dopartition = true;
++    partitioned = false;
++  }
++  r = rsm_test_protocol::OK;
++  assert(pthread_mutex_unlock(&rsm_mutex)==0);
++  return r;
++}
++
++// simulate failure at breakpoint 1 and 2
++
++void 
++rsm::breakpoint1()
++{
++  if (break1) {
++    printf("Dying at breakpoint 1 in rsm!\n");
++    exit(1);
++  }
++}
++
++void 
++rsm::breakpoint2()
++{
++  if (break2) {
++    printf("Dying at breakpoint 2 in rsm!\n");
++    exit(1);
++  }
++}
++
++rsm_test_protocol::status
++rsm::breakpointreq(int b, int &r)
++{
++  r = rsm_test_protocol::OK;
++  assert(pthread_mutex_lock(&rsm_mutex)==0);
++  printf("rsm::breakpointreq: %d\n", b);
++  if (b == 1) break1 = true;
++  else if (b == 2) break2 = true;
++  else if (b == 3 || b == 4) cfg->breakpoint(b);
++  else r = rsm_test_protocol::ERR;
++  assert(pthread_mutex_unlock(&rsm_mutex)==0);
++  return r;
++}
++
++
++
++
+diff -rupN original/rsm_client.cc new/rsm_client.cc
+--- original/rsm_client.cc	1970-01-01 01:00:00.000000000 +0100
++++ new/rsm_client.cc	2012-10-31 13:23:46.836326832 +0000
+@@ -0,0 +1,114 @@
++#include "rsm_client.h"
++#include <vector>
++#include <arpa/inet.h>
++#include <stdio.h>
++
++
++rsm_client::rsm_client(std::string dst)
++{
++  printf("create rsm_client\n");
++  std::vector<std::string> mems;
++
++  pthread_mutex_init(&rsm_client_mutex, NULL);
++  sockaddr_in dstsock;
++  make_sockaddr(dst.c_str(), &dstsock);
++  primary.id = dst;
++  primary.cl = new rpcc(dstsock);
++  primary.nref = 0;
++  int ret = primary.cl->bind(rpcc::to(1000));
++  if (ret < 0) {
++    printf("rsm_client::rsm_client bind failure %d failure w %s; exit\n", ret, 
++     primary.id.c_str());
++    exit(1);
++  }
++  assert(pthread_mutex_lock(&rsm_client_mutex)==0);
++  assert (init_members(true));
++  assert(pthread_mutex_unlock(&rsm_client_mutex)==0);
++  printf("rsm_client: done\n");
++}
++
++// Assumes caller holds rsm_client_mutex 
++void
++rsm_client::primary_failure()
++{
++}
++
++rsm_protocol::status
++rsm_client::invoke(int proc, std::string req, std::string &rep)
++{
++  int ret;
++  rpcc *cl;
++  assert(pthread_mutex_lock(&rsm_client_mutex)==0);
++  while (1) {
++    printf("rsm_client::invoke proc %x primary %s\n", proc, primary.id.c_str());
++    cl = primary.cl;
++    primary.nref++;
++    assert(pthread_mutex_unlock(&rsm_client_mutex)==0);
++    ret = primary.cl->call(rsm_client_protocol::invoke, proc, req, 
++        rep, rpcc::to(5000));
++    assert(pthread_mutex_lock(&rsm_client_mutex)==0);
++    primary.nref--;
++    printf("rsm_client::invoke proc %x primary %s ret %d\n", proc, 
++     primary.id.c_str(), ret);
++    if (ret == rsm_client_protocol::OK) {
++      break;
++    }
++    if (ret == rsm_client_protocol::BUSY) {
++      printf("rsm is busy %s\n", primary.id.c_str());
++      sleep(3);
++      continue;
++    }
++    if (ret == rsm_client_protocol::NOTPRIMARY) {
++      printf("primary %s isn't the primary--let's get a complete list of mems\n", 
++          primary.id.c_str());
++      if (init_members(true))
++        continue;
++    }
++    printf("primary %s failed ret %d\n", primary.id.c_str(), ret);
++    primary_failure();
++    printf ("rsm_client::invoke: retry new primary %s\n", primary.id.c_str());
++  }
++  assert(pthread_mutex_unlock(&rsm_client_mutex)==0);
++  return ret;
++}
++
++bool
++rsm_client::init_members(bool send_member_rpc)
++{
++  if (send_member_rpc) {
++    printf("rsm_client::init_members get members!\n");
++    assert(pthread_mutex_unlock(&rsm_client_mutex)==0);
++    int ret = primary.cl->call(rsm_client_protocol::members, 0, known_mems, 
++            rpcc::to(1000)); 
++    assert(pthread_mutex_lock(&rsm_client_mutex)==0);
++    if (ret != rsm_protocol::OK)
++      return false;
++  }
++  if (known_mems.size() < 1) {
++    printf("rsm_client::init_members do not know any members!\n");
++    assert(0);
++  }
++
++  std::string new_primary = known_mems.back();
++  known_mems.pop_back();
++
++  printf("rsm_client::init_members: primary %s\n", new_primary.c_str());
++
++  if (new_primary != primary.id) {
++    sockaddr_in dstsock;
++    make_sockaddr(new_primary.c_str(), &dstsock);
++    primary.id = new_primary;
++    if (primary.cl) {
++      assert(primary.nref == 0);  // XXX fix: delete cl only when refcnt=0
++      delete primary.cl; 
++    }
++    primary.cl = new rpcc(dstsock);
++
++    if (primary.cl->bind(rpcc::to(1000)) < 0) {
++      printf("rsm_client::rsm_client cannot bind to primary\n");
++      return false;
++    }
++  }
++  return true;
++}
++
+diff -rupN original/rsm_client.h new/rsm_client.h
+--- original/rsm_client.h	1970-01-01 01:00:00.000000000 +0100
++++ new/rsm_client.h	2012-10-31 13:23:46.840326843 +0000
+@@ -0,0 +1,149 @@
++#ifndef rsm_client_h
++#define rsm_client_h
++
++#include "rpc.h"
++#include "rsm_protocol.h"
++#include <string>
++#include <vector>
++
++
++//
++// rsm client interface.
++//
++// The client stubs package up an rpc, and then call the invoke procedure 
++// on the replicated state machine passing the RPC as an argument.  This way 
++// the replicated state machine isn't service specific; any server can use it.
++//
++
++class rsm_client {
++
++  struct primary_t {
++    rpcc *cl;
++    std::string id;
++    int nref;
++  };
++
++ protected:
++  primary_t primary;
++  std::vector<std::string> known_mems;
++  pthread_mutex_t rsm_client_mutex;
++  void primary_failure();
++  bool init_members(bool send_mem_rpc);
++ public:
++  rsm_client(std::string dst);
++  rsm_protocol::status invoke(int proc, std::string req, std::string &rep);
++
++  template<class R, class A1>
++    int call(unsigned int proc, const A1 & a1, R &r);
++
++  template<class R, class A1, class A2>
++    int call(unsigned int proc, const A1 & a1, const A2 & a2, R &r);
++
++  template<class R, class A1, class A2, class A3>
++    int call(unsigned int proc, const A1 & a1, const A2 & a2, const A3 & a3, 
++	     R &r);
++
++  template<class R, class A1, class A2, class A3, class A4>
++    int call(unsigned int proc, const A1 & a1, const A2 & a2, const A3 & a3, 
++	     const A4 & a4, R &r);
++
++  template<class R, class A1, class A2, class A3, class A4, class A5>
++    int call(unsigned int proc, const A1 & a1, const A2 & a2, const A3 & a3, 
++	     const A4 & a4, const A5 & a5, R &r);
++};
++
++template<class R, class A1> int
++  rsm_client::call(unsigned int proc, const A1 & a1, R & r)
++{
++  marshall m;
++  std::string rep;
++  std::string res;
++  m << a1;
++  int intret = invoke(proc, m.str(), rep);
++  unmarshall u(rep);
++  u >> intret;
++  u >> res;
++  unmarshall u1(res);
++  u1 >> r;
++  return intret;
++}
++
++template<class R, class A1, class A2> int
++  rsm_client::call(unsigned int proc, const A1 & a1, const A2 & a2, R & r)
++{
++  marshall m;
++  std::string rep;
++  std::string res;
++  m << a1;
++  m << a2;
++  int intret = invoke(proc, m.str(), rep);
++  unmarshall u(rep);
++  u >> intret;
++  u >> res;
++  unmarshall u1(res);
++  u1 >> r;
++  return intret;
++}
++
++template<class R, class A1, class A2, class A3> int
++  rsm_client::call(unsigned int proc, const A1 & a1, 
++		const A2 & a2, const A3 & a3, R & r)
++{
++  marshall m;
++  std::string rep;
++  std::string res;
++  m << a1;
++  m << a2;
++  m << a3;
++  int intret = invoke(proc, m.str(), rep);
++  unmarshall u(rep);
++  u >> intret;
++  u >> res;
++  unmarshall u1(res);
++  u1 >> r;
++  return intret;
++}
++
++template<class R, class A1, class A2, class A3, class A4> int
++  rsm_client::call(unsigned int proc, const A1 & a1, 
++		   const A2 & a2, const A3 & a3, const A4 & a4, R & r)
++{
++  marshall m;
++  std::string rep;
++  std::string res;
++  m << a1;
++  m << a2;
++  m << a3;
++  m << a4;
++  int intret = invoke(proc, m.str(), rep);
++  unmarshall u(rep);
++  u >> intret;
++  u >> res;
++  unmarshall u1(res);
++  u1 >> r;
++  return intret;
++}
++
++template<class R, class A1, class A2, class A3, class A4, class A5> int
++  rsm_client::call(unsigned int proc, const A1 & a1, 
++		   const A2 & a2, const A3 & a3, const A4 & a4, const A5 & a5,
++		   R & r)
++{
++  marshall m;
++  std::string rep;
++  std::string res;
++  m << a1;
++  m << a2;
++  m << a3;
++  m << a4;
++  m << a5;
++  int intret = invoke(proc, m.str(), rep);
++  unmarshall u(rep);
++  u >> intret;
++  u >> res;
++  unmarshall u1(res);
++  u1 >> r;
++  return intret;
++}
++
++#endif 
+diff -rupN original/rsm.h new/rsm.h
+--- original/rsm.h	1970-01-01 01:00:00.000000000 +0100
++++ new/rsm.h	2012-10-31 13:23:46.824326765 +0000
+@@ -0,0 +1,78 @@
++// replicated state machine interface.
++
++#ifndef rsm_h
++#define rsm_h
++
++#include <string>
++#include <vector>
++#include "rsm_protocol.h"
++#include "rsm_state_transfer.h"
++#include "rpc.h"
++#include <arpa/inet.h>
++#include "config.h"
++
++
++class rsm : public config_view_change {
++ protected:
++  std::map<int, handler *> procs;
++  config *cfg;
++  class rsm_state_transfer *stf;
++  rpcs *rsmrpc;
++  viewstamp myvs;
++  viewstamp last_myvs;
++  std::string primary;
++  bool insync; 
++  bool inviewchange;
++  unsigned nbackup;
++
++  // For testing purposes
++  rpcs *testsvr;
++  bool partitioned;
++  bool dopartition;
++  bool break1;
++  bool break2;
++
++
++  rsm_client_protocol::status client_members(int i, 
++					     std::vector<std::string> &r);
++  rsm_protocol::status invoke(int proc, viewstamp vs, std::string mreq, 
++			      int &dummy);
++  rsm_protocol::status transferreq(std::string src, viewstamp last,
++				   rsm_protocol::transferres &r);
++  rsm_protocol::status transferdonereq(std::string m, int &r);
++  rsm_protocol::status joinreq(std::string src, viewstamp last, 
++			       rsm_protocol::joinres &r);
++  rsm_test_protocol::status test_net_repairreq(int heal, int &r);
++  rsm_test_protocol::status breakpointreq(int b, int &r);
++
++  pthread_mutex_t rsm_mutex;
++  pthread_mutex_t invoke_mutex;
++  pthread_cond_t recovery_cond;
++  pthread_cond_t sync_cond;
++  pthread_cond_t join_cond;
++
++  rsm_client_protocol::status client_invoke(int procno, std::string req, 
++              std::string &r);
++  bool statetransfer(std::string m);
++  bool statetransferdone(std::string m);
++  bool join(std::string m);
++  void set_primary();
++  std::string find_highest(viewstamp &vs, std::string &m, unsigned &vid);
++  bool sync_with_backups();
++  bool sync_with_primary();
++  bool amiprimary_wo();
++  void net_repair_wo(bool heal);
++  void breakpoint1();
++  void breakpoint2();
++ public:
++  rsm (std::string _first, std::string _me);
++  ~rsm() {};
++
++  bool amiprimary();
++  void set_state_transfer(rsm_state_transfer *_stf) { stf = _stf; };
++  void recovery();
++  void commit_change();
++
++};
++
++#endif /* rsm_h */
+diff -rupN original/rsm_protocol.h new/rsm_protocol.h
+--- original/rsm_protocol.h	1970-01-01 01:00:00.000000000 +0100
++++ new/rsm_protocol.h	2012-10-31 13:23:46.840326843 +0000
+@@ -0,0 +1,113 @@
++#ifndef rsm_protocol_h
++#define rsm_protocol_h
++
++#include "rpc.h"
++
++
++class rsm_client_protocol {
++ public:
++  enum xxstatus { OK, ERR, NOTPRIMARY, BUSY};
++  typedef int status;
++  enum rpc_numbers {
++    invoke = 0x9001,
++    members,
++  };
++};
++
++
++struct viewstamp {
++  viewstamp (unsigned int _vid = 0, unsigned int _seqno = 0) {
++    vid = _vid;
++    seqno = _seqno;
++  };
++  unsigned int vid;
++  unsigned int seqno;
++};
++
++class rsm_protocol {
++ public:
++  enum xxstatus { OK, ERR, BUSY};
++  typedef int status;
++  enum rpc_numbers {
++    invoke = 0x10001,
++    transferreq,
++    transferdonereq,
++    joinreq,
++  };
++
++  struct transferres {
++    std::string state;
++    viewstamp last;
++  };
++  
++  struct joinres {
++    std::string log;
++  };
++};
++
++inline bool operator==(viewstamp a, viewstamp b) {
++  return a.vid == b.vid && a.seqno == b.seqno;
++}
++
++inline bool operator>(viewstamp a, viewstamp b) {
++  return (a.vid > b.vid) || ((a.vid == b.vid) && a.seqno > b.seqno);
++}
++
++inline bool operator!=(viewstamp a, viewstamp b) {
++  return a.vid != b.vid || a.seqno != b.seqno;
++}
++
++inline marshall& operator<<(marshall &m, viewstamp v)
++{
++  m << v.vid;
++  m << v.seqno;
++  return m;
++}
++
++inline unmarshall& operator>>(unmarshall &u, viewstamp &v) {
++  u >> v.vid;
++  u >> v.seqno;
++  return u;
++}
++
++inline marshall &
++operator<<(marshall &m, rsm_protocol::transferres r)
++{
++  m << r.state;
++  m << r.last;
++  return m;
++}
++
++inline unmarshall &
++operator>>(unmarshall &u, rsm_protocol::transferres &r)
++{
++  u >> r.state;
++  u >> r.last;
++  return u;
++}
++
++inline marshall &
++operator<<(marshall &m, rsm_protocol::joinres r)
++{
++  m << r.log;
++  return m;
++}
++
++inline unmarshall &
++operator>>(unmarshall &u, rsm_protocol::joinres &r)
++{
++  u >> r.log;
++  return u;
++}
++
++class rsm_test_protocol {
++ public:
++  enum xxstatus { OK, ERR};
++  typedef int status;
++  enum rpc_numbers {
++    net_repair = 0x12001,
++    breakpoint = 0x12002,
++  };
++};
++
++#endif 
+diff -rupN original/rsm_state_transfer.h new/rsm_state_transfer.h
+--- original/rsm_state_transfer.h	1970-01-01 01:00:00.000000000 +0100
++++ new/rsm_state_transfer.h	2012-10-31 13:23:46.848326879 +0000
+@@ -0,0 +1,11 @@
++#ifndef rsm_state_transfer_h
++#define rsm_state_transfer_h
++
++class rsm_state_transfer {
++ public:
++  virtual std::string marshal_state() = 0;
++  virtual void unmarshal_state(std::string) = 0;
++  virtual ~rsm_state_transfer() {};
++};
++
++#endif
+diff -rupN original/rsmtest_client.cc new/rsmtest_client.cc
+--- original/rsmtest_client.cc	1970-01-01 01:00:00.000000000 +0100
++++ new/rsmtest_client.cc	2012-10-31 13:23:46.848326879 +0000
+@@ -0,0 +1,39 @@
++// RPC stubs for clients to talk to rsmtest_server
++
++#include "rsmtest_client.h"
++#include "rpc.h"
++#include <arpa/inet.h>
++
++#include <sstream>
++#include <iostream>
++#include <stdio.h>
++
++rsmtest_client::rsmtest_client(std::string dst)
++{
++  sockaddr_in dstsock;
++  make_sockaddr(dst.c_str(), &dstsock);
++  cl = new rpcc(dstsock);
++  if (cl->bind() < 0) {
++    printf("rsmtest_client: call bind\n");
++  }
++}
++
++int
++rsmtest_client::net_repair(int heal)
++{
++  int r;
++  int ret = cl->call(rsm_test_protocol::net_repair, heal, r);
++  assert (ret == rsm_test_protocol::OK);
++  return r;
++}
++
++int
++rsmtest_client::breakpoint(int b)
++{
++  int r;
++  int ret = cl->call(rsm_test_protocol::breakpoint, b, r);
++  assert (ret == rsm_test_protocol::OK);
++  return r;
++}
++
++
+diff -rupN original/rsmtest_client.h new/rsmtest_client.h
+--- original/rsmtest_client.h	1970-01-01 01:00:00.000000000 +0100
++++ new/rsmtest_client.h	2012-10-31 13:23:46.852326916 +0000
+@@ -0,0 +1,20 @@
++// rsmtest client interface.
++
++#ifndef rsmtest_client_h
++#define rsmtest_client_h
++
++#include <string>
++#include "rsm_protocol.h"
++#include "rpc.h"
++
++// Client interface to the rsmtest server
++class rsmtest_client {
++ protected:
++  rpcc *cl;
++ public:
++  rsmtest_client(std::string d);
++  virtual ~rsmtest_client() {};
++  virtual rsm_test_protocol::status net_repair(int heal);
++  virtual rsm_test_protocol::status breakpoint(int b);
++};
++#endif
+diff -rupN original/rsm_tester.cc new/rsm_tester.cc
+--- original/rsm_tester.cc	1970-01-01 01:00:00.000000000 +0100
++++ new/rsm_tester.cc	2012-10-31 13:23:46.852326916 +0000
+@@ -0,0 +1,40 @@
++//
++// RSM test client
++//
++
++#include "rsm_protocol.h"
++#include "rsmtest_client.h"
++#include "rpc.h"
++#include <arpa/inet.h>
++#include <vector>
++#include <stdlib.h>
++#include <stdio.h>
++#include <string>
++using namespace std;
++
++rsmtest_client *lc;
++
++int
++main(int argc, char *argv[])
++{
++  int r;
++
++  if(argc != 4){
++    fprintf(stderr, "Usage: %s [host:]port [partition] arg\n", argv[0]);
++    exit(1);
++  }
++
++  lc = new rsmtest_client(argv[1]);
++  string command(argv[2]);
++  if (command == "partition") {
++    r = lc->net_repair(atoi(argv[3]));
++    printf ("net_repair returned %d\n", r);
++  } else if (command == "breakpoint") {
++    int b = atoi(argv[3]);
++    r = lc->breakpoint(b);
++    printf ("breakpoint %d returned %d\n", b, r);
++  } else {
++    fprintf(stderr, "Unknown command %s\n", argv[2]);
++  }
++  exit(0);
++}
+diff -rupN original/rsm_tester.pl new/rsm_tester.pl
+--- original/rsm_tester.pl	1970-01-01 01:00:00.000000000 +0100
++++ new/rsm_tester.pl	2012-10-31 13:23:46.852326916 +0000
+@@ -0,0 +1,912 @@
++#!/usr/bin/perl -w
++
++use POSIX ":sys_wait_h";
++use Getopt::Std;
++use strict;
++
++
++my @pid;
++my @logs = ();
++my @views = (); #expected views
++my %in_views; #the number of views a node is expected to be present
++my @p;
++my $t;
++my $always_kill = 0;
++
++use sigtrap 'handler' => \&killprocess, 'HUP', 'INT', 'ABRT', 'QUIT', 'TERM';
++
++sub paxos_log {
++  my $port = shift;
++  return "paxos-$port.log";
++}
++
++sub mydie {
++  my ($s) = @_;
++  killprocess() if ($always_kill);
++  die $s;
++}
++
++sub killprocess {
++  print "killprocess: forcestop all spawned processes...@pid \n";
++  kill 9, @pid;
++}
++
++sub cleanup {
++  kill 9, @pid;
++  unlink(@logs);
++  sleep 2;
++}
++
++sub spawn {
++  my ($p, @a) = @_;
++  my $aa = join("-", @a);
++  if (my $pid = fork) {
++# parent
++    push( @logs, "$p-$aa.log" );
++    if( $p =~ /config_server/ ) {
++      push( @logs, paxos_log($a[1]) );
++    }
++    if( $p =~ /lock_server/ ) {
++      push( @logs, paxos_log($a[1]) );
++    }
++    return $pid;
++  } elsif (defined $pid) {
++# child
++    open(STDOUT, ">>$p-$aa.log")
++      or mydie "Couln't redirect stout\n";
++    open(STDERR, ">&STDOUT")
++      or mydie "Couln't redirect stderr\n";
++    $| = 1;
++    print "$p @a\n";
++    exec "$p @a" 
++      or mydie "Cannot start new $p @a $!\n";
++  } else {
++    mydie "Cannot  fork: $!\n";
++  }
++}
++
++sub randports {
++
++  my $num = shift;
++  my @p = ();
++  for( my $i = 0; $i < $num; $i++ ) {
++    push( @p, int(rand(54000))+10000 );
++  }
++  my @sp = sort { $a <=> $b } @p;
++  return @sp;
++}
++
++sub print_config {
++  my @ports = @_;
++  open( CONFIG, ">config" ) or mydie( "Couldn't open config for writing" );
++  foreach my $p (@ports) {
++    printf CONFIG "%05d\n", $p;
++  }
++  close( CONFIG );
++}
++
++sub spawn_ls {
++  my $master = shift;
++  my $port = shift;
++  return spawn( "./lock_server", $master, $port );
++}
++
++sub spawn_config {
++  my $master = shift;
++  my $port = shift;
++  return spawn( "./config_server", $master, $port );
++}
++
++sub check_views {
++
++  my $l = shift;
++  my $v = shift;
++  my $last_v = shift;
++
++  open( LOG, "<$l" ) 
++    or mydie( "Failed: couldn't read $l" );
++  my @log = <LOG>;
++  close(LOG);
++
++  my @vs = @{$v};
++
++  my $i = 0;
++  my @last_view;
++  foreach my $line (@log) {
++    if( $line =~ /^done (\d+) ([\d\s]+)$/ ) {
++
++      my $num = $1;
++      my @view = split( /\s+/, $2 );
++      @last_view = @view;
++
++      if( $i > $#vs ) {
++# let there be extra views
++        next;
++      }
++
++      my $e = $vs[$i];
++      my @expected = @{$e};
++
++      if( @expected != @view ) {
++        mydie( "Failed: In log $l at view $num is (@view), but expected $i (@expected)" );
++      }
++
++      $i++;
++    }
++  }
++
++  if( $i <= $#vs ) {
++    mydie( "Failed: In log $l, not enough views seen!" );
++  }
++
++  if( defined $last_v ) {
++    my @last_exp_v = @{$last_v};
++    if( @last_exp_v != @last_view ) {
++      mydie( "Failed: In log $l last view didn't match, got view @last_view, but expected @last_exp_v" );
++    }
++  }
++
++}
++
++sub get_num_views {
++
++  my $log = shift;
++  my $including = shift;
++  my $nv = `grep "done " $log | grep "$including" | wc -l`;
++  chomp $nv;
++  return $nv;
++
++}
++
++sub wait_for_view_change {
++
++  my $log = shift;
++  my $num_views = shift;
++  my $including = shift;
++  my $timeout = shift;
++
++  my $start = time();
++  while( (get_num_views( $log, $including ) < $num_views) and
++      ($start + $timeout > time()) ) {
++		my $lastv = `grep done  $log | tail -n 1`;
++		chomp $lastv;
++    print "   Waiting for $including to be present in >=$num_views views in $log (Last view: $lastv)\n";
++    sleep 1;
++  }
++
++  if( get_num_views( $log, $including ) < $num_views) {
++    mydie( "Failed: Timed out waiting for $including to be in >=$num_views in log $log" );
++  }else{
++    print "   Done: $including is in >=$num_views views in $log\n";
++  }
++}
++
++sub waitpid_to {
++  my $pid = shift;
++  my $to = shift;
++
++  my $start = time();
++  my $done_pid;
++  do {
++    sleep 1;
++    $done_pid = waitpid($pid, POSIX::WNOHANG);
++  } while( $done_pid <= 0 and (time() - $start) < $to );
++
++  if( $done_pid <= 0 ) {
++    kill 9,$pid;
++    mydie( "Failed: Timed out waiting for process $pid\n" );
++  } else {
++    return 1;
++  }
++
++}
++
++sub wait_and_check_expected_view($) {
++  my $v = shift;
++  push @views, $v;
++  for (my $i = 0; $i <=$#$v; $i++) {
++    $in_views{$v->[$i]}++;
++  }
++  foreach my $port (@$v) {
++    wait_for_view_change(paxos_log($port), $in_views{$port}, $port, 20);
++  }
++  foreach my $port (@$v) {
++    my $log = paxos_log($port);
++    check_views( $log, \@views );
++  }
++}
++
++sub start_nodes ($$){
++
++  @pid = ();
++  @logs = ();
++  @views = ();
++  for (my $i = 0; $i <= $#p; $i++) {
++    $in_views{$p[$i]} = 0;
++  }
++
++  my $n = shift;
++  my $command = shift;
++
++  for (my $i = 0; $i < $n; $i++) {
++		if ($command eq "ls") {
++			@pid = (@pid, spawn_ls($p[0],$p[$i]));
++			print "Start lock_server on $p[$i]\n";
++		}elsif ($command eq "config_server"){
++			@pid = (@pid, spawn_config($p[0],$p[$i]));
++			print "Start config on $p[$i]\n";
++		}
++    sleep 1;
++
++    my @vv = @p[0..$i];
++    wait_and_check_expected_view(\@vv);
++  }
++
++}
++
++my %options;
++getopts("s:k",\%options);
++if (defined($options{s})) {
++  srand($options{s});
++}
++if (defined($options{k})) {
++  $always_kill = 1;
++}
++
++#get a sorted list of random ports
++@p = randports(5);
++print_config( @p[0..4] );
++
++my @do_run = ();
++my $NUM_TESTS = 17;
++
++# see which tests are set
++if( $#ARGV > -1 ) {
++  foreach my $t (@ARGV) {
++    if( $t < $NUM_TESTS && $t >= 0 ) {
++      $do_run[$t] = 1;
++    }
++  }
++} else {
++# turn on all tests
++  for( my $i = 0; $i < $NUM_TESTS; $i++ ) {
++    $do_run[$i] = 1;
++  }
++}
++
++if ($do_run[0]) {
++  print "test0: start 3-process lock server\n";
++  start_nodes(3,"ls");
++  cleanup();
++  sleep 2;
++}
++
++if ($do_run[1]) {
++  print "test1: start 3-process lock server, kill third server\n";
++  start_nodes(3,"ls");
++
++  print "Kill third server (PID: $pid[2]) on port $p[2]\n";
++  kill "TERM", $pid[2];
++  
++  sleep 5;
++
++  # it should go through 4 views
++  my @v4 = ($p[0], $p[1]);
++  wait_and_check_expected_view(\@v4);
++  
++  cleanup();
++  sleep 2;
++}
++
++if ($do_run[2]) {
++  print "test2: start 3-process lock server, kill first server\n";
++  start_nodes(3,"ls");
++  
++  print "Kill first (PID: $pid[0]) on port $p[0]\n";
++  kill "TERM", $pid[0];
++
++  sleep 5;
++
++  # it should go through 4 views
++  my @v4 = ($p[1], $p[2]);
++  wait_and_check_expected_view(\@v4);
++
++  cleanup();
++  sleep 2;
++}
++
++
++if ($do_run[3]) {
++
++  print "test3: start 3-process lock_server, kill a server, restart a server\n";
++  start_nodes(3,"ls");
++
++  print "Kill server (PID: $pid[2]) on port $p[2]\n";
++  kill "TERM", $pid[2];
++
++  sleep 5;
++
++  my @v4 = ($p[0], $p[1]);
++  wait_and_check_expected_view(\@v4);
++
++  print "Restart killed server on port $p[2]\n";
++  $pid[2] = spawn_ls ($p[0], $p[2]);
++
++  sleep 5;
++
++  my @v5 = ($p[0], $p[1], $p[2]);
++  wait_and_check_expected_view(\@v5);
++
++  cleanup();
++  sleep 2;
++}
++
++if ($do_run[4]) {
++  print "test4: 3-process lock_server, kill third server, kill second server, restart third server, kill third server again, restart second server, re-restart third server, check logs\n";
++  start_nodes(3,"ls");
++  
++  print "Kill server (PID: $pid[2]) on port $p[2]\n";
++  kill "TERM", $pid[2];
++
++  sleep 5;
++  my @v4 = ($p[0], $p[1]);
++  wait_and_check_expected_view(\@v4);
++
++  print "Kill server (PID: $pid[1]) on port $p[1]\n";
++  kill "TERM", $pid[1];
++
++  sleep 5;
++  #no view change can happen because of a lack of majority
++
++  print "Restarting server on port $p[2]\n";
++  $pid[2] = spawn_ls($p[0], $p[2]);
++
++  sleep 5;
++
++  #no view change can happen because of a lack of majority
++  foreach my $port (@p[0..2]) {
++    my $num_v = get_num_views(paxos_log($port), $port);
++    die "$num_v views in ", paxos_log($port), " : no new views should be formed due to the lack of majority\n" if ($num_v != $in_views{$port});
++  }
++
++  # kill node 3 again, 
++  print "Kill server (PID: $pid[2]) on port $p[2]\n";
++  kill "TERM", $pid[2];
++
++  sleep 5;
++
++
++  print "Restarting server on port $p[1]\n";
++  $pid[1] = spawn_ls($p[0], $p[1]);
++
++  sleep 7;
++
++  foreach my $port (@p[0..1]) {
++    $in_views{$port} = get_num_views( paxos_log($port), $port );
++    print "   Node $port is present in ", $in_views{$port}, " views in ", paxos_log($port), "\n";
++  }
++
++  print "Restarting server on port $p[2]\n";
++  $pid[2] = spawn_ls($p[0], $p[2]);
++
++  my @lastv = ($p[0],$p[1],$p[2]);
++  foreach my $port (@lastv) {
++    wait_for_view_change(paxos_log($port), $in_views{$port}+1, $port, 20);
++  }
++
++# now check the paxos logs and make sure the logs go through the right
++# views
++
++  foreach my $port (@lastv) {
++    check_views( paxos_log($port), \@views, \@lastv);
++  }
++
++  cleanup();
++
++}
++
++if ($do_run[5]) {
++  print "test5: 3-process lock_server, send signal 1 to first server, kill third server, restart third server, check logs\n";
++  start_nodes(3,"ls");
++  
++  print "Sending paxos breakpoint 1 to first server on port $p[0]\n";
++  spawn("./rsm_tester", $p[0]+1, "breakpoint", 3);
++
++  sleep 1;
++
++  print "Kill third server (PID: $pid[2]) on port $p[2]\n";
++  kill "TERM", $pid[2];
++
++  sleep 5;
++  foreach my $port (@p[0..2]) {
++    my $num_v = get_num_views( paxos_log($port), $port );
++    die "$num_v views in ", paxos_log($port), " : no new views should be formed due to the lack of majority\n" if ($num_v != $in_views{$port});
++  }
++
++  print "Restarting third server on port $p[2]\n";
++  $pid[2]= spawn_ls($p[0], $p[2]);
++  my @lastv = ($p[1],$p[2]);
++  foreach my $port (@lastv) {
++    wait_for_view_change(paxos_log($port), $in_views{$port}+1, $port, 20);
++  }
++	sleep 10;
++
++# now check the paxos logs and make sure the logs go through the right
++# views
++
++  foreach my $port (@lastv) {
++    check_views( paxos_log($port), \@views, \@lastv);
++  }
++
++  cleanup();
++
++}
++
++if ($do_run[6]) {
++  print "test6: 4-process lock_server, send signal 2 to first server, kill fourth server, restart fourth server, check logs\n";
++  start_nodes(4,"ls");
++  print "Sending paxos breakpoint 2 to first server on port $p[0]\n";
++  spawn("./rsm_tester", $p[0]+1, "breakpoint", 4);
++
++  sleep 1;
++
++  print "Kill fourth server (PID: $pid[3]) on port $p[3]\n";
++  kill "TERM", $pid[3];
++
++  sleep 5;
++
++  foreach my $port ($p[1],$p[2]) {
++      my $num_v = get_num_views( paxos_log($port), $port );
++      die "$num_v views in ", paxos_log($port), " : no new views should be formed due to the lack of majority\n" if ($num_v != $in_views{$port});
++  }
++
++  sleep 5;
++
++  print "Restarting fourth server on port $p[3]\n";
++  $pid[3] = spawn_ls($p[1], $p[3]);
++
++  sleep 5;
++
++  my @v5 = ($p[0],$p[1],$p[2]);
++  foreach my $port (@v5) {
++    $in_views{$port}++;
++  }
++  push @views, \@v5;
++
++  sleep 10;
++
++  # the 6th view will be (2,3)  or (1,2,3,4)
++  my @v6 = ($p[1],$p[2]);
++  foreach my $port (@v6) {
++    $in_views{$port}++;
++  }
++  foreach my $port (@v6) {
++    wait_for_view_change(paxos_log($port), $in_views{$port}+1, $port, 20);
++  }
++
++  # final will be (2,3,4)
++  my @lastv = ($p[1],$p[2],$p[3]);
++  foreach my $port (@lastv) {
++    wait_for_view_change(paxos_log($port), $in_views{$port}+1, $port, 20);
++  }
++  foreach my $port (@lastv) {
++    check_views( paxos_log($port), \@views, \@lastv );
++  }
++  cleanup();
++
++}
++
++if ($do_run[7]) {
++  print "test7: 4-process lock_server, send signal 2 to first server, kill fourth server, kill other servers, restart other servers, restart fourth server, check logs\n";
++  start_nodes(4,"ls");
++  print "Sending paxos breakpoint 2 to first server on port $p[0]\n";
++  spawn("./rsm_tester", $p[0]+1, "breakpoint", 4);
++  sleep 3;
++
++  print "Kill fourth server (PID: $pid[3]) on port $p[3]\n";
++  kill "TERM", $pid[3];
++
++  sleep 5;
++
++  print "Kill third server (PID: $pid[2]) on port $p[2]\n";
++  kill "TERM", $pid[2];
++
++  print "Kill second server (PID: $pid[1]) on port $p[1]\n";
++  kill "TERM", $pid[1];
++
++  sleep 5;
++
++  print "Restarting second server on port $p[1]\n";
++  $pid[1] = spawn_ls($p[0], $p[1]);
++
++  sleep 5;
++
++  print "Restarting third server on port $p[2]\n";
++  $pid[2] = spawn_ls($p[0], $p[2]);
++
++  sleep 5;
++
++#no view change is possible by now because there is no majority
++  foreach my $port ($p[1],$p[2]) {
++    my $num_v = get_num_views( paxos_log($port), $port );
++    die "$num_v views in ", paxos_log($port), " : no new views should be formed due to the lack of majority\n" if ($num_v != $in_views{$port});
++  }
++
++  print "Restarting fourth server on port $p[3]\n";
++  $pid[3] = spawn_ls($p[1], $p[3]);
++
++  sleep 5;
++
++  my @v5 = ($p[0], $p[1], $p[2]);
++  push @views, \@v5;
++  foreach my $port (@v5) {
++    $in_views{$port}++;
++  }
++
++  sleep 15;
++  my @lastv = ($p[1],$p[2],$p[3]);
++  foreach my $port (@lastv) {
++    wait_for_view_change(paxos_log($port), $in_views{$port}+1, $port, 20);
++  }
++
++  foreach my $port (@lastv) {
++    check_views( paxos_log($port), \@views, \@lastv);
++  }
++  
++  cleanup();
++
++}
++
++if ($do_run[8]) {
++  print "test8: start 3-process lock service\n";
++	start_nodes(3,"ls");
++  
++  print "Start lock_tester $p[0]\n";
++  $t = spawn("./lock_tester", $p[0]);
++
++  print "   Wait for lock_tester to finish (waitpid $t)\n";
++  waitpid_to($t, 600);
++
++  if( system( "grep \"passed all tests successfully\" lock_tester-$p[0].log" ) ) {
++    mydie( "Failed lock tester for test 8" );
++  }
++
++  cleanup();
++  sleep 2;
++}
++
++if ($do_run[9]) {
++
++  print "test9: start 3-process rsm, kill second slave while lock_tester is running\n";
++	start_nodes(3,"ls");
++  
++  print "Start lock_tester $p[0]\n";
++  $t = spawn("./lock_tester", $p[0]);
++
++  sleep int(rand(10)+1);
++
++  print "Kill slave (PID: $pid[2]) on port $p[2]\n";
++  kill "TERM", $pid[2];
++
++  sleep 3;
++
++  # it should go through 4 views
++  my @v4 = ($p[0], $p[1]);
++  wait_and_check_expected_view(\@v4);
++
++  print "   Wait for lock_tester to finish (waitpid $t)\n";
++  waitpid_to($t, 600);
++
++  if( system( "grep \"passed all tests successfully\" lock_tester-$p[0].log" ) ) {
++    mydie( "Failed lock tester for test 9" );
++  }
++
++  cleanup();
++  sleep 2;
++}
++
++if ($do_run[10]) {
++
++  print "test10: start 3-process rsm, kill second slave and restarts it later while lock_tester is running\n";
++	start_nodes(3,"ls");
++  
++  print "Start lock_tester $p[0]\n";
++  $t = spawn("./lock_tester", $p[0]);
++
++  sleep int(rand(10)+1);
++
++  print "Kill slave (PID: $pid[2]) on port $p[2]\n";
++  kill "TERM", $pid[2];
++
++  sleep 3;
++
++  # it should go through 4 views
++  my @v4 = ($p[0], $p[1]);
++  wait_and_check_expected_view(\@v4);
++
++  sleep 3;
++
++  print "Restarting killed lock_server on port $p[2]\n";
++  $pid[2] = spawn_ls($p[0], $p[2]);
++  my @v5 = ($p[0],$p[1],$p[2]);
++  wait_and_check_expected_view(\@v5);
++
++  print "   Wait for lock_tester to finish (waitpid $t)\n";
++  waitpid_to($t, 600);
++
++  if( system( "grep \"passed all tests successfully\" lock_tester-$p[0].log" ) ) {
++    mydie( "Failed lock tester for test 10" );
++  }
++
++  cleanup();
++  sleep 2;
++}
++
++
++if ($do_run[11]) {
++
++  print "test11: start 3-process rsm, kill primary while lock_tester is running\n";
++	start_nodes(3,"ls");
++
++  print "Start lock_tester $p[0]\n";
++  $t = spawn("./lock_tester", $p[0]);
++
++  sleep int(rand(10)+1);
++
++  print "Kill primary (PID: $pid[0]) on port $p[0]\n";
++  kill "TERM", $pid[0];
++
++  sleep 3;
++
++  # it should go through 4 views
++  my @v4 = ($p[1], $p[2]);
++  wait_and_check_expected_view(\@v4);
++
++  print "   Wait for lock_tester to finish (waitpid $t)\n";
++  waitpid_to($t, 600);
++
++  if( system( "grep \"passed all tests successfully\" lock_tester-$p[0].log" ) ) {
++    mydie( "Failed lock tester for test 11" );
++  }
++
++  cleanup();
++  sleep 2;
++}
++
++if ($do_run[12]) {
++
++  print "test12: start 3-process rsm, kill master at break1 and restart it while lock_tester is running\n";
++  
++  start_nodes(3, "ls");
++
++  print "Start lock_tester $p[0]\n";
++  $t = spawn("./lock_tester", $p[0]);
++
++  sleep 1;
++
++  print "Kill master (PID: $pid[0]) on port $p[0] at breakpoint 1\n";
++  spawn("./rsm_tester", $p[0]+1, "breakpoint", 1);
++
++
++  sleep 1;
++
++  # it should go through 5 views
++  my @v4 = ($p[1], $p[2]);
++  wait_and_check_expected_view(\@v4);
++
++  print "Restarting killed lock_server on port $p[0]\n";
++  $pid[0] = spawn_ls($p[1], $p[0]);
++
++  sleep 3;
++
++  # the last view should include all nodes
++  my @lastv = ($p[0],$p[1],$p[2]);
++  foreach my $port (@lastv) {
++    wait_for_view_change(paxos_log($port), $in_views{$port}+1, $port, 20);
++  }
++
++  foreach my $port (@lastv) {
++    check_views( paxos_log($port), \@views, \@lastv);
++  }
++
++  print "   Wait for lock_tester to finish (waitpid $t)\n";
++  waitpid_to($t, 600);
++
++  if( system( "grep \"passed all tests successfully\" lock_tester-$p[0].log" ) ) {
++    mydie( "Failed lock tester for test 12" );
++  }
++
++  cleanup();
++  sleep 2;
++}
++
++if ($do_run[13]) {
++
++  print "test13: start 3-process rsm, kill slave at break1 and restart it while lock_tester is running\n";
++
++  start_nodes(3, "ls");
++
++  print "Start lock_tester $p[0]\n";
++  $t = spawn("./lock_tester", $p[0]);
++
++  sleep 1;
++
++  print "Kill slave (PID: $pid[2]) on port $p[2] at breakpoint 1\n";
++  spawn("./rsm_tester", $p[2]+1, "breakpoint", 1);
++
++  sleep 1;
++
++  # it should go through 4 views
++  my @v4 = ($p[0], $p[1]);
++  wait_and_check_expected_view(\@v4);
++
++  print "Restarting killed lock_server on port $p[2]\n";
++  $pid[2] = spawn_ls($p[0], $p[2]);
++
++  sleep 3;
++
++  # the last view should include all nodes
++  my @lastv = ($p[0],$p[1],$p[2]);
++  foreach my $port (@lastv) {
++    wait_for_view_change(paxos_log($port), $in_views{$port}+1, $port, 20);
++  }
++
++  foreach my $port (@lastv) {
++    check_views( paxos_log($port), \@views, \@lastv);
++  }
++
++  print "   Wait for lock_tester to finish (waitpid $t)\n";
++  waitpid_to($t, 600);
++
++  if( system( "grep \"passed all tests successfully\" lock_tester-$p[0].log" ) ) {
++    mydie( "Failed lock tester for test 13" );
++  }
++
++  cleanup();
++  sleep 2;
++}
++
++if ($do_run[14]) {
++
++  print "test14: start 5-process rsm, kill slave break1, kill slave break2\n";
++
++  start_nodes(5, "ls");
++
++  print "Start lock_tester $p[0]\n";
++  $t = spawn("./lock_tester", $p[0]);
++
++  sleep 1;
++
++  print "Kill slave (PID: $pid[4]) on port $p[4] at breakpoint 1\n";
++  spawn("./rsm_tester", $p[4]+1, "breakpoint", 1);
++
++
++  print "Kill slave (PID: $pid[3]) on port $p[3] at breakpoint 2\n";
++  spawn("./rsm_tester", $p[3]+1, "breakpoint", 2);
++
++
++  sleep 1;
++
++  # two view changes:
++
++  print "first view change wait\n";
++  my @lastv = ($p[0],$p[1],$p[2],$p[3]);
++  foreach my $port (@lastv) {
++    wait_for_view_change(paxos_log($port), $in_views{$port}+1, $port, 20);
++  }
++
++  print "second view change wait\n";
++
++  @lastv = ($p[0],$p[1],$p[2]);
++  foreach my $port (@lastv) {
++    wait_for_view_change(paxos_log($port), $in_views{$port}+1, $port, 20);
++  }
++
++  print "   Wait for lock_tester to finish (waitpid $t)\n";
++  waitpid_to($t, 600);
++
++  if( system( "grep \"passed all tests successfully\" lock_tester-$p[0].log" ) ) {
++    mydie( "Failed lock tester for test 14" );
++  }
++
++  cleanup();
++  sleep 2;
++}
++
++if ($do_run[15]) {
++
++  print "test15: start 5-process rsm, kill slave break1, kill primary break2\n";
++
++  start_nodes(5, "ls");
++
++  print "Start lock_tester $p[0]\n";
++  $t = spawn("./lock_tester", $p[0]);
++
++  sleep 1;
++
++  print "Kill slave (PID: $pid[4]) on port $p[4] at breakpoint 1\n";
++  spawn("./rsm_tester", $p[4]+1, "breakpoint", 1);
++
++
++  print "Kill primary (PID: $pid[0]) on port $p[0] at breakpoint 2\n";
++  spawn("./rsm_tester", $p[0]+1, "breakpoint", 2);
++
++  sleep 1;
++
++  # two view changes:
++
++  print "first view change wait\n";
++  my @lastv = ($p[0],$p[1],$p[2],$p[3]);
++  foreach my $port (@lastv) {
++    wait_for_view_change(paxos_log($port), $in_views{$port}+1, $port, 20);
++  }
++
++  print "second view change wait\n";
++
++  @lastv = ($p[1],$p[2],$p[3]);
++  foreach my $port (@lastv) {
++    wait_for_view_change(paxos_log($port), $in_views{$port}+1, $port, 20);
++  }
++
++  print "   Wait for lock_tester to finish (waitpid $t)\n";
++  waitpid_to($t, 600);
++
++  if( system( "grep \"passed all tests successfully\" lock_tester-$p[0].log" ) ) {
++    mydie( "Failed lock tester for test 15" );
++  }
++
++  cleanup();
++  sleep 2;
++}
++
++if ($do_run[16]) {
++
++  print "test16: start 3-process rsm, partition primary, heal it\n";
++
++  start_nodes(3, "ls");
++
++  print "Start lock_tester $p[0]\n";
++  $t = spawn("./lock_tester", $p[0]);
++
++  sleep 1;
++
++  print "Partition primary (PID: $pid[0]) on port $p[0] at breakpoint\n";
++
++  spawn("./rsm_tester", $p[0]+1, "partition", 0);
++
++  sleep 3;
++
++  print "first view change wait\n";
++  my @lastv = ($p[1],$p[2]);
++  foreach my $port (@lastv) {
++    wait_for_view_change(paxos_log($port), $in_views{$port}+1, $port, 20);
++  }
++
++  sleep 1;
++
++  print "Heal partition primary (PID: $pid[0]) on port $p[0] at breakpoint\n";
++  spawn("./rsm_tester", $p[0]+1, "partition", 1);
++
++  sleep 1;
++
++  # xxx it should test that this is the 5th view!
++  print "second view change wait\n";
++  @lastv = ($p[0], $p[1],$p[2]);
++  foreach my $port (@lastv) {
++    wait_for_view_change(paxos_log($port), $in_views{$port}+1, $port, 20);
++  }
++  
++  print "   Wait for lock_tester to finish (waitpid $t)\n";
++  waitpid_to($t, 600);
++
++  if( system( "grep \"passed all tests successfully\" lock_tester-$p[0].log" ) ) {
++    mydie( "Failed lock tester for test 16" );
++  }
++
++  cleanup();
++  sleep 2;
++}
++
++print "tests done OK\n";
++
++unlink("config");

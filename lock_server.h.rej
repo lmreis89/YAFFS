@@ -1,0 +1,21 @@
+--- lock_server.h	2012-11-26 11:53:44.641427430 +0000
++++ lock_server.h	2012-11-26 11:53:55.777482649 +0000
+@@ -8,14 +8,15 @@
+ #include "lock_protocol.h"
+ #include "lock_client.h"
+ #include "rpc.h"
+-
++#include "rsm.h"
+ class lock_server {
+-
++ private:
++  class rsm *rsm;
+  protected:
+   int nacquire;
+ 
+  public:
+-  lock_server();
++  lock_server(class rsm *rsm=0);
+   ~lock_server() {};
+   lock_protocol::status stat(int clt, lock_protocol::lockid_t lid, int &);
+ };

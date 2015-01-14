@@ -1,0 +1,128 @@
+<?xml version="1.0" encoding="UTF-8" standalone="yes" ?>
+<CodeBlocks_project_file>
+	<FileVersion major="1" minor="6" />
+	<Project>
+		<Option title="lab6" />
+		<Option pch_mode="2" />
+		<Option compiler="gcc" />
+		<Build>
+			<Target title="Debug">
+				<Option output="bin/Debug/lab6" prefix_auto="1" extension_auto="1" />
+				<Option object_output="obj/Debug/" />
+				<Option type="1" />
+				<Option compiler="gcc" />
+				<Compiler>
+					<Add option="-g" />
+				</Compiler>
+			</Target>
+			<Target title="Release">
+				<Option output="bin/Release/lab6" prefix_auto="1" extension_auto="1" />
+				<Option object_output="obj/Release/" />
+				<Option type="1" />
+				<Option compiler="gcc" />
+				<Compiler>
+					<Add option="-O2" />
+				</Compiler>
+				<Linker>
+					<Add option="-s" />
+				</Linker>
+			</Target>
+		</Build>
+		<Compiler>
+			<Add option="-Wall" />
+		</Compiler>
+		<Unit filename="DirHelper.cc" />
+		<Unit filename="DirHelper.d" />
+		<Unit filename="DirHelper.h" />
+		<Unit filename="config.cc" />
+		<Unit filename="config.d" />
+		<Unit filename="config.h" />
+		<Unit filename="extent_client.cc" />
+		<Unit filename="extent_client.d" />
+		<Unit filename="extent_client.h" />
+		<Unit filename="extent_protocol.h" />
+		<Unit filename="extent_server.cc" />
+		<Unit filename="extent_server.d" />
+		<Unit filename="extent_server.h" />
+		<Unit filename="extent_smain.cc" />
+		<Unit filename="extent_smain.d" />
+		<Unit filename="fuse.cc" />
+		<Unit filename="fuse.d" />
+		<Unit filename="fuse.h" />
+		<Unit filename="fuse_low.h" />
+		<Unit filename="gettime.cc" />
+		<Unit filename="gettime.d" />
+		<Unit filename="gettime.h" />
+		<Unit filename="handle.cc" />
+		<Unit filename="handle.d" />
+		<Unit filename="handle.h" />
+		<Unit filename="lock_client.cc" />
+		<Unit filename="lock_client.d" />
+		<Unit filename="lock_client.h" />
+		<Unit filename="lock_demo.cc" />
+		<Unit filename="lock_protocol.h" />
+		<Unit filename="lock_server.cc" />
+		<Unit filename="lock_server.d" />
+		<Unit filename="lock_server.h" />
+		<Unit filename="lock_smain.cc" />
+		<Unit filename="lock_smain.d" />
+		<Unit filename="lock_tester.cc" />
+		<Unit filename="lock_tester.d" />
+		<Unit filename="log.cc" />
+		<Unit filename="log.d" />
+		<Unit filename="log.h" />
+		<Unit filename="main.cpp" />
+		<Unit filename="mtrand.cc" />
+		<Unit filename="mtrand.d" />
+		<Unit filename="mtrand.h" />
+		<Unit filename="paxos.cc" />
+		<Unit filename="paxos.d" />
+		<Unit filename="paxos.h" />
+		<Unit filename="paxos_protocol.h" />
+		<Unit filename="rpc/connection.cc" />
+		<Unit filename="rpc/connection.d" />
+		<Unit filename="rpc/connection.h" />
+		<Unit filename="rpc/fifo.h" />
+		<Unit filename="rpc/jsl_log.cc" />
+		<Unit filename="rpc/jsl_log.d" />
+		<Unit filename="rpc/jsl_log.h" />
+		<Unit filename="rpc/marshall.h" />
+		<Unit filename="rpc/method_thread.h" />
+		<Unit filename="rpc/pollmgr.cc" />
+		<Unit filename="rpc/pollmgr.d" />
+		<Unit filename="rpc/pollmgr.h" />
+		<Unit filename="rpc/rpc.cc" />
+		<Unit filename="rpc/rpc.d" />
+		<Unit filename="rpc/rpc.h" />
+		<Unit filename="rpc/rpctest.cc" />
+		<Unit filename="rpc/slock.h" />
+		<Unit filename="rpc/thr_pool.cc" />
+		<Unit filename="rpc/thr_pool.d" />
+		<Unit filename="rpc/thr_pool.h" />
+		<Unit filename="rsm.cc" />
+		<Unit filename="rsm.d" />
+		<Unit filename="rsm.h" />
+		<Unit filename="rsm_client.cc" />
+		<Unit filename="rsm_client.d" />
+		<Unit filename="rsm_client.h" />
+		<Unit filename="rsm_protocol.h" />
+		<Unit filename="rsm_state_transfer.h" />
+		<Unit filename="rsm_tester.cc" />
+		<Unit filename="rsm_tester.d" />
+		<Unit filename="rsmtest_client.cc" />
+		<Unit filename="rsmtest_client.h" />
+		<Unit filename="test-lab-4-b.c">
+			<Option compilerVar="CC" />
+		</Unit>
+		<Unit filename="test-lab-4-c.c">
+			<Option compilerVar="CC" />
+		</Unit>
+		<Unit filename="yfs_client.cc" />
+		<Unit filename="yfs_client.d" />
+		<Unit filename="yfs_client.h" />
+		<Extensions>
+			<code_completion />
+			<debugger />
+		</Extensions>
+	</Project>
+</CodeBlocks_project_file>
