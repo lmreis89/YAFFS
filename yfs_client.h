@@ -11,7 +11,7 @@
 
 #include "lock_protocol.h"
 #include "lock_client.h"
-
+//comment to make changes for PR (sorry balewey, I'm using this project to test a bugfix on codacy) 
   class yfs_client {
   extent_client *ec;
   lock_client *lc;
